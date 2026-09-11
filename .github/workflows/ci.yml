@@ -9,19 +9,16 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      # 第1步：把你的代码拉下来 (更新到 v6)
       - name: Checkout code
         uses: actions/checkout@v6
 
-      # 第2步：登录 GitHub 自带的镜像仓库（GHCR）(更新到 v6)
       - name: Log in to GitHub Container Registry
-        uses: docker/login-action@v6
+        uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # 第3步：构建 Docker 镜像并推送 (更新到 v6)
       - name: Build and push Docker image
         uses: docker/build-push-action@v6
         with:
