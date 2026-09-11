@@ -1,0 +1,41 @@
+aiohttp==3.10.10
+tiktoken==0.8.0
+python-dotenv==1.0.1
+pydantic==2.9.2
+openai==1.51.2
+requests==2.32.3
+tqdm==4.66.5
+rank-bm25==0.2.2
+tabulate==0.9.0
+pyprojroot==0.3.0
+pandas==2.2.3
+faiss-cpu==1.9.0.post1
+langchain>=0.3.3,<0.4
+langchain-community>=0.3,<0.4
+json_repair==0.35.0
+google-ai-generativelanguage==0.6.15
+google-api-core==2.24.1
+google-api-python-client==2.160.0
+google-auth==2.38.0
+google-auth-httplib2==0.2.0
+google-generativeai==0.8.4
+googleapis-common-protos==1.66.0
+click==8.1.7
+httpx==0.27.2
+aiosqlite==0.20.0
+aiofiles==24.1.0
+# RAGAS 评估流水线依赖（见 scripts/eval/）
+# 注意：ragas 0.2.x 与 langchain 0.3.x / openai 1.51.x 兼容；ragas 0.3+ 会升级 langchain 导致冲突
+ragas>=0.2.0,<0.3
+langchain-openai>=0.2.0,<0.3
+# 重试装饰器（src/ingestion.py、src/api_requests.py 直接 import，不能只靠 langchain 传递安装）
+tenacity>=8.2,<9
+# Redis（embedding 缓存 + 固定窗口限流，异步客户端 redis.asyncio）
+redis>=5.0
+# Celery（PDF 解析与索引构建异步任务，Redis 作为 broker/backend）
+celery>=5.3
+# FastAPI 服务运行依赖（app/ 目录），Docker 镜像构建必需
+fastapi>=0.115,<1.0
+uvicorn>=0.30
+# /upload 接口解析 multipart/form-data 文件上传必需
+python-multipart>=0.0.9

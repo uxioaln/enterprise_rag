@@ -1,0 +1,41 @@
+{
+  "model": {
+    "embedding_model": "text-embedding-v4",
+    "embedding_dim": 1024,
+    "embedding_api_base": "https://api.agicto.cn/v1",
+    "embedding_api_key": "",
+    "llm_model": "qwen3.8-max",
+    "llm_api_base": "https://api.agicto.cn/v1",
+    "llm_api_key": ""
+  },
+  "retrieval": {
+    "top_n_retrieval": 10,
+    "use_vector_dbs": true,
+    "use_bm25_db": false,
+    "parent_document_retrieval": false,
+    "llm_reranking": false,
+    "llm_reranking_sample_size": 30
+  },
+  "pipeline": {
+    "use_serialized_tables": false,
+    "parallel_requests": 1,
+    "answering_model": "qwen3.8-max",
+    "config_suffix": ""
+  },
+  "redis": {
+    "url": "redis://localhost:6379/0",
+    "embedding_ttl": 3600,
+    "embedding_key_prefix": "emb:v4:"
+  },
+  "rate_limit": {
+    "embedding": { "window": 60, "limit": 100 },
+    "llm": { "window": 60, "limit": 30 }
+  },
+  "retry_loop": {
+    "enable": false,
+    "max_retries": 2,
+    "threshold": 0.8,
+    "eval_model": "qwen3.8-max",
+    "rewrite_model": "qwen3.8-max"
+  }
+}

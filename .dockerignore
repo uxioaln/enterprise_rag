@@ -1,0 +1,47 @@
+# 版本控制与编辑器
+.git
+.gitignore
+.gitattributes
+.idea
+.vscode
+.cursorindexingignore
+
+# Python 缓存与构建产物
+__pycache__/
+**/__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.eggs/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# 虚拟环境
+.venv/
+venv/
+env/
+
+# 密钥文件：绝不打入镜像，运行时通过 --env-file 注入
+.env
+.env.*
+# env 为密钥模板，同样不打入镜像
+env
+
+# 数据目录（PDF/解析结果/向量库等大文件）：运行时以卷挂载 -v $(pwd)/data:/app/data
+data/
+
+# 测试与文档（服务运行不需要）
+tests/
+docs/
+*.md
+
+# Docker 自身文件
+Dockerfile
+docker-compose.yml
+docker-compose.yaml
+.dockerignore
+
+# macOS 系统文件
+.DS_Store

@@ -1,0 +1,138 @@
+# =========================================================================
+# 企业知识库 RAG 问答服务编排：api（FastAPI）+ worker（Celery）+ redis
+#
+# 说明：
+# - 向量库为 FAISS 本地文件（data/stock_data/databases/vector_dbs），无独立服务，
+#   通过 ./data 卷挂载到 api 与 worker 容器，实现索引共享与持久化
+# - Redis 承担三个角色：embedding 缓存、API 限流、Celery broker/backend
+# - 首次启动前：cp env .env 并填入真实密钥
+#
+# 一键启动：
+#   docker compose up -d --build
+# =========================================================================
+
+# 自定义 bridge 网络：三个服务以服务名（redis / api / worker）互相寻址
+networks:
+  kb-net:
+    driver: bridge
+
+services:
+  # ------------------------------------------------------------------
+  # Redis：embedding 缓存 + 限流 + Celery broker/backend
+  # ------------------------------------------------------------------
+  redis:
+    image: redis:7-alpine
+    container_name: kb-redis
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      # 持久化 AOF 文件到宿主机（与 api/worker 共享同一 ./data 根目录，便于备份与排查）
+      - ./data/redis:/data
+    networks:
+      - kb-net
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+    # Redis 默认不对外暴露端口，仅容器网络内访问；需要本机调试时取消下面注释
+    # ports:
+    #   - "6379:6379"
+
+  # ------------------------------------------------------------------
+  # API 服务：FastAPI + uvicorn（/upload /chat /history /health /tasks）
+  # ------------------------------------------------------------------
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: kb-rag:latest
+    container_name: kb-api
+    restart: unless-stopped
+    # 命令同 Dockerfile 默认 CMD，这里显式写出便于一眼看清启动入口
+    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+    ports:
+      - "8000:8000"
+    env_file:
+      # 密钥文件不存在时忽略（此时仅缓存/限流/入库等功能不可用，服务仍可启动）
+      - path: .env
+        required: false
+    environment:
+      # 容器网络内通过服务名访问 Redis（覆盖 config.json 的 localhost）
+      KB_REDIS__URL: redis://redis:6379/0
+      # 保证 /app/src 与 /app/app 可被 Python 导入（覆盖 env_file 中可能缺失的 PYTHONPATH）
+      PYTHONPATH: /app
+      TZ: Asia/Shanghai
+    working_dir: /app
+    volumes:
+      # FAISS 向量库 / BM25 / 解析产物 / 会话数据库（SQLite）均在此目录持久化
+      - ./data:/app/data
+      # 配置文件单独挂载：宿主机修改 config.json 后由 _config_watcher 热重载，无需重启容器
+      - ./config.json:/app/config.json
+      # 二开热更新：源码只读挂载，宿主机改代码后容器内立即生效（:ro 防止容器内误写宿主文件）
+      - ./app:/app/app:ro
+      - ./src:/app/src:ro
+      - ./main.py:/app/main.py:ro
+    depends_on:
+      redis:
+        condition: service_healthy
+    networks:
+      - kb-net
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      # Pipeline 启动时需加载 FAISS 索引，放宽启动探测期
+      start_period: 120s
+
+  # ------------------------------------------------------------------
+  # Celery worker：异步执行 PDF 解析（MinerU）与向量化入库（FAISS 加锁更新）
+  # ------------------------------------------------------------------
+  worker:
+    # 复用 api 构建出的镜像，保证与 api 代码完全一致
+    image: kb-rag:latest
+    container_name: kb-worker
+    restart: unless-stopped
+    # 与 Dockerfile 中说明一致的 threads 池：共享进程内存，配合 FAISS 类级锁安全串行化写入
+    entrypoint: ["celery"]
+    command:
+      - -A
+      - app.celery_app:celery_app
+      - worker
+      - --loglevel=info
+      - --pool=threads
+      - --concurrency=4
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      KB_REDIS__URL: redis://redis:6379/0
+      # 与 api 保持一致，确保 Celery worker 能导入 src 包
+      PYTHONPATH: /app
+      TZ: Asia/Shanghai
+    working_dir: /app
+    # worker 容器只跑 celery，不监听 8000 端口（镜像默认 HEALTHCHECK 是给 api 的
+    # curl /health，对 worker 会一直 connection refused 误报 unhealthy）。
+    # 这里覆盖为 celery 自带 ping 探针：能返回 pong 说明 worker 进程在线且与 redis broker 连通。
+    healthcheck:
+      test: ["CMD-SHELL", "celery -A app.celery_app:celery_app inspect ping --timeout=5 2>/dev/null | grep -q pong || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    volumes:
+      # 与 api 共享同一 data 目录：worker 入库的新索引/解析产物对 api 端立即可见
+      - ./data:/app/data
+      # 同 api：挂载 config.json 以支持热重载（worker 也会读取检索/模型配置）
+      - ./config.json:/app/config.json
+      # 二开热更新：源码只读挂载，与 api 保持同一份宿主机代码（:ro 防止容器内误写）
+      - ./app:/app/app:ro
+      - ./src:/app/src:ro
+      - ./main.py:/app/main.py:ro
+    depends_on:
+      redis:
+        condition: service_healthy
+    networks:
+      - kb-net

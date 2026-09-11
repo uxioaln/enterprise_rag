@@ -1,0 +1,37 @@
+# 使用方法：cp env .env，然后在 .env 中填入真实凭证（本文件仅作模板，请勿写入真实 key）
+#
+# 当前入库/问答链路（embedding + LLM + 重排）统一走 AGICTO 平台：
+#   - embedding：text-embedding-v4
+#   - LLM：qwen3.8-max（api_provider 默认 dashscope，底层即 AGICTO 兼容接口）
+#   - 重排：LLMReranker 默认使用 agicto
+# 因此仅 AGICTO_API_KEY 为必填；其余 key 默认链路不读取，留空或注释即可。
+
+# 【必填】AGICTO 平台（OpenAI 兼容接口 https://api.agicto.cn/v1）API Key
+# 用于嵌入模型调用、文本模型（qwen3.8-max）问答以及 /chat 接口的 SSE 流式输出
+AGICTO_API_KEY=your_agicto_api_key_here
+
+# 【可选】FastAPI 全局 CORS 允许来源（逗号分隔），未设置时默认允许开发环境本地前端：
+# http://localhost:3000, http://localhost:5173, http://localhost:8080
+# 生产环境请显式配置，如：https://kb.example.com,https://www.example.com
+# 注意：设为 * 时因 CORS 规范会自动关闭 allow_credentials
+ALLOWED_ORIGINS=
+
+# 【可选】以下三类 key 仅在显式切换 provider 时才需要，默认 agicto/dashscope 链路不读取：
+#   - OPENAI_API_KEY：api_provider / embedding_provider 切到 "openai" 时
+#   - GEMINI_API_KEY：api_provider 切到 "gemini" 时
+#   - JINA_API_KEY：使用 JinaReranker（jina-reranker-v2）时；当前默认 LLMReranker 不读取
+# OPENAI_API_KEY=
+# GEMINI_API_KEY=
+# JINA_API_KEY=
+
+# 【可选】会话存储后端：sqlite（默认，推荐生产，持久化） / memory（纯内存，开发测试）
+STORAGE_BACKEND=sqlite
+# SQLite 数据库文件路径（可选，默认 data/chat_history.db）
+# KB_DB_PATH=data/chat_history.db
+
+# 以下 KB_ 前缀环境变量可覆盖 config.json 中的同名配置（嵌套用双下划线），
+# 无需重启服务即可生效；config.json 变更后由后台任务自动热重载
+# KB_MODEL__LLM_MODEL=qwen3.8-max
+# KB_MODEL__LLM_API_KEY=your_llm_api_key
+# KB_RETRIEVAL__TOP_N_RETRIEVAL=10
+# KB_PIPELINE__ANSWERING_MODEL=qwen3.8-max
