@@ -63,7 +63,7 @@ class VectorDBIngestor:
         self.embedding_client = OpenAI(
             api_key=os.getenv("AGICTO_API_KEY"),
             base_url="https://api.agicto.cn/v1",
-            timeout=None,
+            timeout=60,  # embedding 调用超时 60 秒，避免 AGICTO 挂起时无限等待
             max_retries=2
         )
 

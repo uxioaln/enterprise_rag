@@ -102,6 +102,23 @@ class RetryLoopConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class ContextCompressionConfig:
+    """两级上下文压缩开关配置（纯规则实现，不产生额外 LLM 调用）。
+
+    enable_l1：L1 工具结果裁剪开关——检索段落替换为"前200字摘要+文档ID+回读路径"，
+              完整原文落盘，供 A/B 对比接入前后效果；
+    l1_store_dir：L1 完整原文落盘目录（Docker 部署时建议挂载卷持久化）；
+    enable_l2：L2 历史对话压缩开关——超过 l2_max_rounds 轮时早期轮合并为一条摘要；
+    l2_max_rounds：保留完整记录的最近轮数（默认 4：摘要占 1 条消息后，
+              总数不超过对话历史层保留窗口 5，避免下游二次摘要）。
+    """
+    enable_l1: bool = False
+    l1_store_dir: str = "data/retrieved_docs"
+    enable_l2: bool = False
+    l2_max_rounds: int = 4
+
+
+@dataclass(frozen=True, slots=True)
 class AppConfig:
     """全局应用配置聚合。"""
     model: ModelConfig = field(default_factory=ModelConfig)
@@ -110,6 +127,7 @@ class AppConfig:
     redis: RedisConfig = field(default_factory=RedisConfig)
     rate_limit: RateLimitConfig = field(default_factory=RateLimitConfig)
     retry_loop: RetryLoopConfig = field(default_factory=RetryLoopConfig)
+    context_compression: ContextCompressionConfig = field(default_factory=ContextCompressionConfig)
     loaded_at: float = field(default_factory=time.time)
     source: str = "default"
 
@@ -192,6 +210,10 @@ def _build_config_from_dict(data: dict) -> AppConfig:
     retry_loop_cfg = RetryLoopConfig(
         **{k: v for k, v in data.get("retry_loop", {}).items() if k in RetryLoopConfig.__dataclass_fields__}
     )
+    # 两级上下文压缩开关（L1 工具结果裁剪 / L2 历史对话压缩，默认关闭）
+    context_compression_cfg = ContextCompressionConfig(
+        **{k: v for k, v in data.get("context_compression", {}).items() if k in ContextCompressionConfig.__dataclass_fields__}
+    )
     return AppConfig(
         model=model_cfg,
         retrieval=retrieval_cfg,
@@ -199,6 +221,7 @@ def _build_config_from_dict(data: dict) -> AppConfig:
         redis=redis_cfg,
         rate_limit=rate_limit_cfg,
         retry_loop=retry_loop_cfg,
+        context_compression=context_compression_cfg,
         loaded_at=time.time(),
         source=data.get("_source", "dict"),
     )

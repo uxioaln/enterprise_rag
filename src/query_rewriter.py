@@ -90,7 +90,7 @@ def rewrite_query(
     current_query: str,
     critique: str,
     prev_docs_summary: str = "",
-    model: str = "qwen3.8-max",
+    model: str = "qwen-plus",
 ) -> RewrittenQuery:
     """根据评估反馈改写查询。
 
@@ -106,7 +106,7 @@ def rewrite_query(
         current_query：当前轮使用的查询（首轮与 original_query 相同）
         critique：评估器给出的反思说明
         prev_docs_summary：上一轮检索到的文档摘要
-        model：改写使用的模型名，默认 qwen3.8-max
+        model：改写使用的模型名，默认 qwen-plus
 
     返回：
         RewrittenQuery 结构化改写结果

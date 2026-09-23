@@ -51,7 +51,7 @@ class LLMReranker:
         if self.provider == "openai":
             return OpenAI(
                 api_key=os.getenv("OPENAI_API_KEY"),
-                timeout=None,
+                timeout=300,  # 重排生成类调用超时 300 秒，避免服务端挂起时无限等待
                 max_retries=2
             )
         elif self.provider == "agicto":
@@ -59,7 +59,7 @@ class LLMReranker:
             return OpenAI(
                 api_key=os.getenv("AGICTO_API_KEY"),
                 base_url="https://api.agicto.cn/v1",
-                timeout=None,
+                timeout=300,  # 重排生成类调用超时 300 秒，避免 AGICTO 挂起时无限等待
                 max_retries=2
             )
         else:
@@ -82,13 +82,13 @@ class LLMReranker:
             response_dict = response.model_dump()
             return response_dict
         elif self.provider == "agicto":
-            # 通过 AGICTO OpenAI 兼容接口调用 qwen3.8-max
+            # 通过 AGICTO OpenAI 兼容接口调用 qwen-plus
             messages = [
                 {"role": "system", "content": self.system_prompt_rerank_single_block},
                 {"role": "user", "content": user_prompt},
             ]
             completion = self.llm.chat.completions.create(
-                model="qwen3.8-max",
+                model="qwen-plus",
                 temperature=0,
                 messages=messages
             )
@@ -121,13 +121,13 @@ class LLMReranker:
             response_dict = response.model_dump()
             return response_dict
         elif self.provider == "agicto":
-            # 通过 AGICTO OpenAI 兼容接口调用 qwen3.8-max
+            # 通过 AGICTO OpenAI 兼容接口调用 qwen-plus
             messages = [
                 {"role": "system", "content": self.system_prompt_rerank_multiple_blocks},
                 {"role": "user", "content": user_prompt},
             ]
             completion = self.llm.chat.completions.create(
-                model="qwen3.8-max",
+                model="qwen-plus",  
                 temperature=0,
                 messages=messages
             )

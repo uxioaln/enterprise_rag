@@ -59,6 +59,11 @@ def _run_config(config_name: str, dataset: list[dict]) -> Path:
             record["references"] = answer_dict.get("references", [])
             record["step_by_step_analysis"] = answer_dict.get("step_by_step_analysis", "")
             record["reasoning_summary"] = answer_dict.get("reasoning_summary", "")
+            # A/B 实验新增：落盘 token 用量，供 ab_compare 计算削减率
+            # prompt_tokens 优先（服务端真实值），context_tokens 为 tiktoken 估算兜底
+            record["prompt_tokens"] = answer_dict.get("prompt_tokens")
+            record["completion_tokens"] = answer_dict.get("completion_tokens")
+            record["context_tokens"] = answer_dict.get("context_tokens")
         except Exception as err:
             # 单条失败不中断整体流程，记录错误信息
             record["answer"] = ""

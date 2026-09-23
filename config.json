@@ -28,8 +28,14 @@
     "embedding_key_prefix": "emb:v4:"
   },
   "rate_limit": {
-    "embedding": { "window": 60, "limit": 100 },
-    "llm": { "window": 60, "limit": 30 }
+    "embedding": {
+      "window": 60,
+      "limit": 100
+    },
+    "llm": {
+      "window": 60,
+      "limit": 30
+    }
   },
   "retry_loop": {
     "enable": false,

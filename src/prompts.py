@@ -113,6 +113,13 @@ class AnswerWithRAGContextNamePrompt:
 如上下文无相关信息，返回'N/A'。
 """)
 
+        answer_statement: str = Field(default="", description="""
+用一句完整的陈述句直接回答问题（含公司名主语与关键事实），
+名称等关键事实需与上下文原文完全一致。
+示例："南方航空股份有限公司的CEO是张三。"
+如上下文无相关信息，写"年报中未披露<问题主题>相关信息"。
+""")
+
     pydantic_schema = re.sub(r"^ {4}", "", inspect.getsource(AnswerSchema), flags=re.MULTILINE)
 
     example = r"""
@@ -126,10 +133,11 @@ class AnswerWithRAGContextNamePrompt:
   "step_by_step_analysis": "1. 问题询问'南方航空股份有限公司'的CEO。CEO通常是公司最高管理者，有时也称总裁或董事总经理。\n2. 信息来源为该公司的年报，将用来确认CEO身份。\n3. 年报中明确指出张三为公司总裁兼首席执行官。\n4. 因此，CEO为张三。",
   "reasoning_summary": "年报明确写明张三为总裁兼CEO，直接回答了问题。",
   "relevant_pages": [58],
-  "final_answer": "张三"
+  "final_answer": "张三",
+  "answer_statement": "南方航空股份有限公司的CEO是张三。"
 }
 ```
-""" 
+"""
 
     system_prompt = build_system_prompt(instruction, example)
     system_prompt_with_schema = build_system_prompt(instruction, example, pydantic_schema)
@@ -194,6 +202,13 @@ class AnswerWithRAGContextNumberPrompt:
 - 如上下文无相关信息，返回'N/A'
 """)
 
+        answer_statement: str = Field(default="", description="""
+用一句完整的陈述句直接回答问题（含公司名主语、指标名与数值），
+数值保留上下文原文写法（含千分位逗号与单位）。
+示例："万科企业股份有限公司2022年总资产为18,500,342,000元。"
+如上下文无相关信息，写"年报中未披露<问题主题>相关信息"。
+""")
+
     pydantic_schema = re.sub(r"^ {4}", "", inspect.getsource(AnswerSchema), flags=re.MULTILINE)
 
     example = r"""
@@ -207,7 +222,8 @@ class AnswerWithRAGContextNumberPrompt:
   "step_by_step_analysis": "1. 问题询问'万科企业股份有限公司'2022年总资产。'总资产'指公司拥有的全部资源。\n2. 年报第78页有'合并资产负债表'，列明2022年12月31日总资产。\n3. 该行数据为'总资产'，与问题完全匹配。\n4. 报告显示总资产为18500342000元。\n5. 无需计算，直接取值。",
   "reasoning_summary": "年报78页直接给出2022年总资产，无需推算。",
   "relevant_pages": [78],
-  "final_answer": 18500342000
+  "final_answer": 18500342000,
+  "answer_statement": "万科企业股份有限公司2022年总资产为18500342000元。"
 }
 ```
 
@@ -221,7 +237,8 @@ class AnswerWithRAGContextNumberPrompt:
   "step_by_step_analysis": "1. 问题询问研发设备原值。\n2. 年报35页有'固定资产净值'12500元，但为净值，非原值。\n3. 37页有'累计折旧'11万元，但未区分研发设备。\n4. 无法直接获得研发设备原值。\n5. 因此答案为'N/A'。",
   "reasoning_summary": "年报无研发设备原值，严格匹配应返回N/A。",
   "relevant_pages": [35, 37],
-  "final_answer": "N/A"
+  "final_answer": "N/A",
+  "answer_statement": "年报中未披露研发设备原值相关信息。"
 }
 ```
 """
@@ -252,6 +269,12 @@ class AnswerWithRAGContextBooleanPrompt:
 一个从上下文中精确提取的布尔值（True或False），直接回答问题。
 如果问题问某事是否发生，且上下文有相关信息但未发生，则返回False。
 """)
+
+        answer_statement: str = Field(default="", description="""
+用一句完整的陈述句直接回答问题（含公司名主语与结论依据），
+结论与关键事实需与上下文原文一致。
+示例："万科企业股份有限公司年报未宣布分红政策变更。"
+""")
     pydantic_schema = re.sub(r"^ {4}", "", inspect.getsource(AnswerSchema), flags=re.MULTILINE)
     example = r"""
 问题：
@@ -263,7 +286,8 @@ class AnswerWithRAGContextBooleanPrompt:
   "step_by_step_analysis": "1. 问题询问是否有分红政策变更。\n2. 年报12、18页提到年度分红金额增加，但政策未变。\n3. 45页有分红细节。\n4. 持续小幅增长，符合既定政策。\n5. 问题问的是政策变更，非金额变化。",
   "reasoning_summary": "年报显示分红金额变化但政策未变，答案为False。",
   "relevant_pages": [12, 18, 45],
-  "final_answer": false
+  "final_answer": false,
+  "answer_statement": "万科企业股份有限公司年报未宣布分红政策变更。"
 }
 ```
 """
@@ -307,6 +331,13 @@ class AnswerWithRAGContextNamesPrompt:
 如无信息，返回'N/A'。
 """)
 
+        answer_statement: str = Field(default="", description="""
+用一句完整的陈述句直接回答问题（含公司名主语与实体列举），
+实体名称需与上下文原文完全一致。
+示例："公司新任高管为张三和李四。"
+如无信息，写"年报中未披露<问题主题>相关信息"。
+""")
+
     pydantic_schema = re.sub(r"^ {4}", "", inspect.getsource(AnswerSchema), flags=re.MULTILINE)
 
     example = r"""
@@ -320,7 +351,8 @@ class AnswerWithRAGContextNamesPrompt:
     "step_by_step_analysis": "1. 问题询问公司新任高管名单。\n2. 年报89页列出新高管签约信息。\n3. 10.9节说明张三为新任总法律顾问，10.10节李四为新任COO。\n4. 综上，张三和李四为新任高管。",
     "reasoning_summary": "年报10.9、10.10节明确列出张三、李四为新任高管。",
     "relevant_pages": [89],
-    "final_answer": ["张三", "李四"]
+    "final_answer": ["张三", "李四"],
+    "answer_statement": "公司新任高管为张三和李四。"
 }
 ```
 """
@@ -586,6 +618,13 @@ class AnswerWithRAGContextStringPrompt:
 如上下文无相关信息，可简要说明未找到答案。
 """)
 
+        answer_statement: str = Field(default="", description="""
+用一句完整的陈述句直接回答问题（含公司名主语与关键事实/数值），
+关键事实与数值需与上下文原文一致，数值保留原文写法（含千分位逗号与单位）。
+示例："万科企业股份有限公司2022年主营业务为房地产开发与物业服务。"
+如上下文无相关信息，写"年报中未披露<问题主题>相关信息"。
+""")
+
     pydantic_schema = re.sub(r"^ {4}", "", inspect.getsource(AnswerSchema), flags=re.MULTILINE)
 
     example = r'''
@@ -599,7 +638,8 @@ class AnswerWithRAGContextStringPrompt:
   "step_by_step_analysis": "1. 问题要求总结2022年万科企业股份有限公司的主营业务。\n2. 年报第10-12页详细描述了公司主营业务，包括房地产开发、物业服务等。\n3. 结合上下文，归纳出主要业务板块。\n4. 重点突出房地产开发和相关服务。\n5. 形成简明扼要的总结。",
   "reasoning_summary": "年报10-12页明确列出主营业务，答案基于原文归纳。",
   "relevant_pages": [10, 11, 12],
-  "final_answer": "万科企业股份有限公司2022年主营业务包括房地产开发、物业服务、租赁住房、物流仓储等，核心业务为住宅及商业地产开发与运营。"
+  "final_answer": "万科企业股份有限公司2022年主营业务包括房地产开发、物业服务、租赁住房、物流仓储等，核心业务为住宅及商业地产开发与运营。",
+  "answer_statement": "万科企业股份有限公司2022年主营业务以房地产开发为核心，涵盖物业服务、租赁住房与物流仓储。"
 }
 ```
 '''

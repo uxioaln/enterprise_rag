@@ -9,9 +9,14 @@ rank-bm25==0.2.2
 tabulate==0.9.0
 pyprojroot==0.3.0
 pandas==2.2.3
+# PDF 页数读取：src/pdf_mineru.py 的 get_total_pages 依赖此库判断是否需要分段解析
+# 缺失时会走单段提交，>200 页的 PDF 会被 MinerU 云端拒绝
+pypdfium2>=4.30,<5
 faiss-cpu==1.9.0.post1
 langchain>=0.3.3,<0.4
 langchain-community>=0.3,<0.4
+# LangGraph：Agent 唯一问答链路的图编排引擎（app/agent.py 直接 import，服务启动即依赖）
+langgraph>=1.0,<1.1
 json_repair==0.35.0
 google-ai-generativelanguage==0.6.15
 google-api-core==2.24.1

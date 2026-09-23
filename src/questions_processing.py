@@ -25,7 +25,7 @@ class QuestionsProcessor:
         top_n_retrieval: int = 10,
         parallel_requests: int = 10,
         api_provider: str = "dashscope", # openai
-        answering_model: str = "qwen3.8-max", # gpt-4o-2024-08-06
+        answering_model: str = "qwen-plus", # gpt-4o-2024-08-06
         full_context: bool = False
     ):
         # 初始化问题处理器，配置检索、模型、并发等参数
@@ -69,7 +69,7 @@ class QuestionsProcessor:
             
         return "\n\n---\n\n".join(context_parts)
 
-    def _extract_references(self, pages_list: list, company_name: str) -> list:
+    def _extract_references(self, pages_list: list, company_name: str, retrieval_results: list = None) -> list:
         # 根据公司名和页码列表，提取引用信息
         if self.subset_path is None:
             raise ValueError("subset_path is required for new challenge pipeline when processing references.")
@@ -81,15 +81,29 @@ class QuestionsProcessor:
             self.companies_df = pd.read_csv(self.subset_path, encoding='gbk')
 
         # 从 subset.csv 中查找该公司对应的 PDF 文件名
+        # 原逻辑：取该公司第一条记录的 file_name 作为默认文件名（保留作为兜底）
         matching_rows = self.companies_df[self.companies_df['company_name'] == company_name]
         if matching_rows.empty:
             company_file_name = ""
         else:
             company_file_name = matching_rows.iloc[0]['file_name']
 
+        # 新增：同一公司可能存在多个文件，优先以检索结果中每个页码实际所属文档的
+        # file_name 为准建立页码到文件名的映射，修复引用文件名被固定为第一条记录的问题
+        page_to_file_name: dict = {}
+        if retrieval_results:
+            for result in retrieval_results:
+                page = result.get("page")
+                file_name = result.get("file_name")
+                if page is not None and file_name and page not in page_to_file_name:
+                    page_to_file_name[page] = file_name
+
         refs = []
         for page in pages_list:
-            refs.append({"pdf_file_name": company_file_name, "page_index": page})
+            refs.append({
+                "pdf_file_name": page_to_file_name.get(page, company_file_name),
+                "page_index": page
+            })
         return refs
 
     def _validate_page_references(self, claimed_pages: list, retrieval_results: list, min_pages: int = 2, max_pages: int = 8) -> list:
@@ -179,7 +193,7 @@ class QuestionsProcessor:
             pages = answer_dict.get("relevant_pages", [])
             validated_pages = self._validate_page_references(pages, retrieval_results)
             answer_dict["relevant_pages"] = validated_pages
-            answer_dict["references"] = self._extract_references(validated_pages, company_name)
+            answer_dict["references"] = self._extract_references(validated_pages, company_name, retrieval_results=retrieval_results)
         print(f"[计时] [get_answer_for_company] 生成阶段耗时: {t6-t4:.2f} 秒")
         return answer_dict
 
@@ -229,25 +243,64 @@ class QuestionsProcessor:
         schema: str,
         company_name: Optional[str] = None,
         retrieval_results: Optional[list] = None,
+        history: Optional[list] = None,
+        enable_l1: Optional[bool] = None,
+        history_keep_rounds: int = 5,
     ) -> dict:
         """根据给定的纯文本上下文列表生成答案。
         若提供 retrieval_results（含 page/text），则按原格式构建 rag_context（保留页码）并执行页码校验；
         否则按纯文本拼接上下文，并跳过页码校验（保留 LLM 声称的页码）。
         若提供 company_name，则提取引用；否则尝试从问题中抽取公司名。
+        history 为前序多轮问答记录，不为空时透传给 get_answer_from_rag_context，
+        拼入 user 消息的"对话历史"段，使本轮能感知上一轮交互。
+        enable_l1：L1 工具结果裁剪开关（A/B 实验 pipeline 侧透传）——
+        None 时维持 config.json 在线开关现状（在线服务链路行为不变），
+        非 None 时以传入值为准（评测链路 baseline 强制关 / ours 强制开）。
+        history_keep_rounds：对话历史保留轮数，透传给 ConversationHistoryLayer，
+        超过该轮数时早期轮合并为摘要；默认 5 与原行为一致。
         """
         # 构建 rag_context：优先用 retrieval_results（保留页码），与原 _format_retrieval_results 一致
         if retrieval_results:
-            rag_context = self._format_retrieval_results(retrieval_results)
+            # L1 工具结果裁剪开关判定：优先用 pipeline 透传值（A/B 实验），
+            # 未透传（None）时回落 config.json 的在线开关（原有行为）
+            from app.config import get_config
+            cc_cfg = get_config().context_compression
+            l1_enabled = enable_l1 if enable_l1 is not None else cc_cfg.enable_l1
+            if l1_enabled:
+                from src.context_compression import L1ToolResultCompressor, RetrievedDoc
+                l1 = L1ToolResultCompressor(store_dir=cc_cfg.l1_store_dir)
+                docs = [RetrievedDoc(doc_id=f"{company_name or 'unknown'}_p{r.get('page', 0)}_{i}",
+                                     content=r["text"],
+                                     source_path=r.get("file_name", ""))
+                        for i, r in enumerate(retrieval_results)]
+                # 传入当前问题，启用 L1 问题感知截断（按问题关键词选句，
+                # 保留片段中后部的关键数字句；question 为空时退化为前 N 字）。
+                # A1 修复：compress 返回纯摘要，此处按 baseline 的页码三引号
+                # 格式包装（与 L1 关闭时的 _format_retrieval_results 完全一致，
+                # 仅正文由全文换为压缩摘要）；不再附带"文档ID/存储路径"提示，
+                # 避免诱导 LLM 尝试回读服务端未注册的 read_file 工具
+                summaries = l1.compress(docs, question=question)
+                context_parts = [
+                    f'Text retrieved from page {r["page"]}: \n"""\n{summary}\n"""'
+                    for r, summary in zip(retrieval_results, summaries)
+                ]
+                rag_context = "\n\n---\n\n".join(context_parts)
+            else:
+                rag_context = self._format_retrieval_results(retrieval_results)
         else:
-            # 纯文本上下文：拼接为带引号的块（与原格式尽量对齐）
-            parts = [f'Text retrieved: \n"""\n{ctx}\n"""' for ctx in contexts if ctx]
-            rag_context = "\n\n---\n\n".join(parts)
+            # 纯文本上下文：经动态附件层渲染为带引号的块（与原格式完全一致）
+            # DynamicAttachmentsLayer 分块模式输出：Text retrieved + 三引号包裹，块间 --- 分隔
+            from src.context_layers import DynamicAttachmentsLayer
+            rag_context = DynamicAttachmentsLayer([ctx for ctx in contexts if ctx]).render()
 
         answer_dict = self.openai_processor.get_answer_from_rag_context(
             question=question,
             rag_context=rag_context,
             schema=schema,
-            model=self.answering_model
+            model=self.answering_model,
+            history=history,
+            # L2 对话历史保留轮数透传（A/B 实验：ours=5 摘要注入 / baseline=全量）
+            history_keep_rounds=history_keep_rounds
         )
         self.response_data = self.openai_processor.response_data
 
@@ -267,7 +320,7 @@ class QuestionsProcessor:
                 # 无检索结果时无法校验，直接保留 LLM 声称的页码
                 validated_pages = pages if isinstance(pages, list) else []
             answer_dict["relevant_pages"] = validated_pages
-            answer_dict["references"] = self._extract_references(validated_pages, company_name)
+            answer_dict["references"] = self._extract_references(validated_pages, company_name, retrieval_results=retrieval_results)
         return answer_dict
 
     def _extract_companies_from_subset(self, question_text: str) -> list[str]:

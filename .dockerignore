@@ -5,6 +5,8 @@
 .idea
 .vscode
 .cursorindexingignore
+.trae/
+.github/
 
 # Python 缓存与构建产物
 __pycache__/
@@ -32,10 +34,18 @@ env
 # 数据目录（PDF/解析结果/向量库等大文件）：运行时以卷挂载 -v $(pwd)/data:/app/data
 data/
 
+
+# 本地产物：context_compression 自测输出 / wheel 缓存
+retrieved_docs_test/
+wheelhouse/
+
 # 测试与文档（服务运行不需要）
 tests/
 docs/
 *.md
+setup.py
+pytest.ini
+requirements-test.txt
 
 # Docker 自身文件
 Dockerfile

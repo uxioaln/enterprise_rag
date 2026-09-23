@@ -1,356 +1,216 @@
-> # 企业知识库 RAG 系统
+# enterprise_rag
 
-基于深度检索增强生成（RAG）的企业研报问答系统，针对中芯国际相关券商研报、财报、机构调研纪要等 PDF 文档，提供可溯源的多步推理问答。系统通过 **MinerU 云端解析** + **AGICTO 平台大模型**（`qwen3.8-max` 文本模型 / `text-embedding-v4` 嵌入模型）+ **FAISS / BM25 混合检索** + **LLM 重排** + **结构化 Chain-of-Thought 推理**，实现从 PDF 原始文档到可溯源答案的端到端流水线。
+**面向金融研报 / 长文档的深度问答 Agent**：用 LangGraph StateGraph 编排"检索 → 重排 → 生成 → 置信度校验 → 重试"全链路，重点解决长上下文下的 Token 爆炸与多轮对话退化，答案可溯源到 PDF 页码。
+
+[![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![Status](https://img.shields.io/badge/Status-开发中-orange)]()
 
 ---
 
-## 系统架构
+## 动机
+
+为什么不直接用现成 RAG 框架硬套：
+
+1. **长文档**：一份年报动辄上百页，全量塞上下文既不现实也不经济，解析、分块、检索每一环都需要针对金融文档（表格、页码、多公司对比）定制，通用框架的默认管线控制粒度不够。
+2. **多轮退化**：朴素 RAG 把全部历史和工具结果原样拼接，30+ 轮长程对话后 Token 爆炸、早期关键信息被稀释，答案质量随轮数下降。
+3. **可追溯引用**：金融场景的答案必须能落到"哪份文档、哪一页"，这在工程上要求页码贯穿解析到生成的全链路，而不是事后补引用。
+
+## 架构
 
 ```mermaid
 flowchart TD
-    A["PDF 研报"] --> B["[1] MinerU 云端解析<br/>Markdown + content_list.json + images/"]
-    B --> C["[2] 文本分块<br/>文本 / 表格 / 图片 chunk，每块带真实页码"]
-    C --> D["[3] 向量化入库<br/>FAISS 索引 + BM25 索引"]
-    D --> E["[4] 问题处理<br/>公司路由 → 检索 → 重排 → LLM 推理"]
-    E --> F["[5] 结构化答案输出<br/>分步推理 / 推理摘要 / 相关页面 / 最终答案"]
+    subgraph OFF["离线：解析与入库（Celery worker 异步）"]
+        A["PDF 上传 POST /upload"] --> B["MinerU 多模态解析<br/>Markdown + content_list，保留页码与表格"]
+        B --> C["多模态分块"]
+        C --> D["FAISS 向量索引 + BM25 关键词索引"]
+    end
+
+    CHAT["POST /chat<br/>读取会话历史，L2 历史压缩（开关，默认关）"]
+
+    subgraph LG["LangGraph StateGraph：/chat 服务链路（4 节点线性，无回环）"]
+        F["select_tool<br/>意图识别：仅见工具菜单"]
+        G["load_schema<br/>按需加载命中工具完整 Schema"]
+        H["execute_tool<br/>执行检索（默认单路向量，可开关混合检索 + LLM 重排）<br/>Schema 用后即清"]
+        I["generate<br/>L1 工具结果裁剪（开关）<br/>结构化生成 + 页码校验"]
+        F --> G --> H --> I
+    end
+
+    CHAT --> F
+    I --> OUT["输出：结构化答案 + 页码引用"]
+
+    subgraph RT["置信度校验与自动重试循环：Pipeline 层（retry_loop.enable 开关，默认关闭）"]
+        R0["retrieve 检索"] --> R1["generate 生成"]
+        R1 --> R2{"evaluate：三维置信度评估<br/>retrieval / faithfulness / completeness<br/>加权 overall（失败时降级启发式评分）"}
+        R2 -- "overall 大于阈值 0.8" --> R3["输出：采纳历史最优答案<br/>附 confidence + retry_metadata"]
+        R2 -- "未达标且重试次数未用尽" --> R4["rewrite_query：基于 critique 改写查询<br/>expand / refine / decompose / rephrase<br/>与当前查询相似度过高时强制追加限定词"]
+        R4 --> R0
+        R2 -- "已达最大重试次数（forced_exit）" --> R3
+    end
+
+    EV["评测脚本 scripts/eval"] -. "批量推理调用 answer_with_contexts，可开启重试循环" .-> R0
+    D -. "索引共享（volume 挂载）" .-> H
 ```
 
-全流程说明：PDF 研报经 MinerU 云端 API 解析为 Markdown 与结构化 `content_list.json`（保留真实页码、表格、图片），按 `page_idx` 进行多模态分块后同时构建 FAISS 向量索引与 BM25 关键词索引；问答时先做公司路由，再混合检索、LLM 重排筛选上下文，最终由大模型生成结构化、可溯源到具体 PDF 页码的答案。
-
----
+图中 StateGraph 的 4 个节点与 [app/agent.py](app/agent.py) 一一对应，线性流转、无回环。置信度校验与重试不在 LangGraph 图内，而是 Pipeline 层的 `_answer_with_retry_loop`：每轮 retrieve → generate 后做三维置信度评估，`overall` 超过阈值 0.8 即停止；未达标则基于评估反思（critique）改写查询重试，全程保留置信度最高的一轮，超过最大重试次数（默认 2）强制退出并标记 `forced_exit`。该循环挂在库级链路 `answer_with_contexts` 上，由 `retry_loop.enable` 开关控制（默认关闭）；`/chat` 服务链路当前固定走 Agent 图，不经过重试循环。离线链路由 Celery + Redis 异步执行：上传接口立即返回 `task_id`，解析与入库进度可查询。Redis 同时承担 embedding 缓存、API 限流和 Celery broker 三个角色。
 
 ## 快速开始
 
-### 30 秒极简体验
+前置要求：Docker 与 Docker Compose。
 
 ```bash
-# 1. 配置密钥
-cp env .env && vim .env
-# 2. 一键启动
-docker compose up -d --build
-# 3. 访问 http://localhost:8000/docs
-```
+# 1. 克隆并配置密钥（env 为模板文件）
+git clone https://github.com/uxioaln/enterprise_rag.git
+cd enterprise_rag
+cp env .env
 
-### 🚀 快速开始（Docker Compose 推荐）
-
-项目根目录已提供 [docker-compose.yml](docker-compose.yml)，一键编排 **api / worker / redis** 三个服务，免去手动安装 Redis、配置 Python 环境与分别启动进程的繁琐。
-
-系统要求：Docker 24+ 与 Docker Compose v2（`docker compose` 子命令）、4GB+ 内存。
-
-| 服务 | 镜像 | 作用 |
-|---|---|---|
-| `api` | `kb-rag:latest`（本仓库 [Dockerfile](Dockerfile) 构建） | FastAPI 应用，`uvicorn app.main:app`，对外暴露 8000 端口，提供 `/upload` `/chat` `/history` `/health` `/tasks` 接口 |
-| `worker` | `kb-rag:latest`（复用 api 镜像，仅启动命令不同） | Celery worker，`celery -A app.celery_app:celery_app worker --pool=threads --concurrency=4`，异步执行 PDF 解析 -> 真实页码分块 -> 向量化入库（FAISS 加锁更新）；`/upload` 受理后立即返回 202，实际入库由 worker 后台完成 |
-| `redis` | `redis:7-alpine` | 同时承担 embedding 缓存、固定窗口限流计数、Celery broker/backend 三个角色；AOF 持久化到 `./data/redis` |
-
-三者通过自定义 bridge 网络 `kb-net` 互通，容器间以服务名 `redis` / `api` / `worker` 互相寻址。
-
-#### 前置准备
-
-1. 在项目根目录执行 `cp env .env`，并填入 `AGICTO_API_KEY` 等真实凭证（模板见下文「配置密钥」）。
-
-#### 启动与访问
-
-```bash
+# 2. 编辑 .env，填入 AGICTO_API_KEY（唯一必填项），然后一键启动
 docker compose up -d --build
 ```
 
-- API 服务：http://localhost:8000 ，交互式文档 http://localhost:8000/docs
-- 查看日志：`docker compose logs -f api worker`
-- 查看容器状态：`docker compose ps`
+`.env` 关键内容：
 
-#### 关键配置说明
+```dotenv
+# 必填：AGICTO 平台（OpenAI 兼容接口 https://api.agicto.cn/v1）API Key
+# embedding（text-embedding-v4）/ LLM（qwen3.8-max）/ LLM 重排均走此平台
+AGICTO_API_KEY=sk-your-key-here
 
-- **Redis 连接**：容器内 `KB_REDIS__URL` 已由 compose 文件覆盖为 `redis://redis:6379/0`，**无需在 `.env` 中再设置 `KB_REDIS__URL`**；本地直连调试时则保持 `.env` 中 `redis://localhost:6379/0`。
-- **数据持久化**：`./data` 目录挂载到 `api` 与 `worker` 容器的 `/app/data`，二者**共享同一份 FAISS 索引、PDF 解析产物与 SQLite 聊天记录**；worker 入库后的新索引对 api 端立即可见，容器重建后不丢失。
-- **配置热重载**：`./config.json` 单独挂载到 `/app/config.json`，宿主机修改后自动热重载（原理见 [docs/configuration.md](docs/configuration.md)），无需重启容器。
-- **Redis 调试端口**：默认不对外暴露 6379；需要本机直连时在 [docker-compose.yml](docker-compose.yml) 取消 `redis` 服务的 `ports: - "6379:6379"` 注释。
+# 可选：CORS 允许来源，逗号分隔；默认放行 localhost:3000/5173/8080
+# ALLOWED_ORIGINS=https://your-frontend.example.com
 
-#### 停止与清理
-
-```bash
-# 停止并删除容器/网络（保留宿主机 ./data 数据）
-docker compose down
-
-# 警告：加 -v 会删除 Redis 数据卷（./data/redis 下的 AOF 文件），
-# 导致 embedding 缓存与限流计数丢失；FAISS 索引与聊天记录在 ./data 下，不受影响
-docker compose down -v
+# 可选：会话存储后端，sqlite（默认，持久化）/ memory（开发测试）
+# STORAGE_BACKEND=sqlite
 ```
 
-> 提示：`api` 与 `worker` 必须共享相同的 `./data` 卷，否则 worker 解析入库的数据 api 端无法检索；二者镜像与代码完全一致，仅启动命令不同。
-
-#### 配置密钥
-
-将 `env` 文件重命名为 `.env`，并填入真实凭证：
+注意：api 容器启动时需加载 FAISS 索引，健康检查宽限期为 120s，首次启动请耐心等待 `docker compose ps` 变为 healthy。
 
 ```bash
-# AGICTO 平台（OpenAI 兼容接口）API Key，用于文本模型与嵌入模型调用
-AGICTO_API_KEY=your_agicto_api_key_here
+# 3. 上传 PDF 研报（异步入库，立即返回 task_id）
+curl -X POST http://localhost:8000/upload \
+  -F "file=@./兴业银行2024年报.pdf" \
+  -F "company_name=兴业银行"
+# → {"task_id":"...","status":"pending"}
 
-# FastAPI 全局 CORS 允许来源（逗号分隔），未设置时默认允许开发环境前端
-ALLOWED_ORIGINS=
+# 4. 查询入库进度
+curl http://localhost:8000/tasks/<task_id>
+# → {"task_id":"...","status":"success","detail":{...}}
 
-# 会话存储后端：sqlite（默认）/ memory
-STORAGE_BACKEND=sqlite
-# KB_DB_PATH=data/chat_history.db
-
-# Redis 连接（默认 redis://localhost:6379/0）
-# KB_REDIS__URL=redis://localhost:6379/0
-
-# KB_ 前缀环境变量覆盖 config.json（嵌套用双下划线）
-# 示例：KB_MODEL__LLM_MODEL / KB_REDIS__EMBEDDING_TTL / KB_RATE_LIMIT__LLM__LIMIT / KB_RETRY_LOOP__ENABLE=true
-
-# 可选：其他模型服务的 Key（如未使用可忽略）
-OPENAI_API_KEY=
-GEMINI_API_KEY=
-JINA_API_KEY=
+# 5. 问答（stream=false 返回标准 JSON，默认为 SSE 流式）
+curl -X POST "http://localhost:8000/chat?stream=false" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "session_id": "demo-001",
+    "question": "\"兴业银行\" 2024 年的不良贷款率是多少？"
+  }'
 ```
 
-> 说明：
->
-> - 所有 LLM 与嵌入调用均通过 AGICTO 平台统一进行，仅需配置 `AGICTO_API_KEY`。
-> - MinerU 云端解析的 API Key 当前内置在 [src/pdf_mineru.py](src/pdf_mineru.py)，如需替换为自己的 Key，请修改该文件中的 `api_key` 变量。
-> - `/upload` 接口的 MinerU 解析采用签名 URL 直传本地文件方式（无需 OSS），PDF 保存到本地后由 MinerU 自动拉起解析任务。
+响应节选（完整字段见 `/docs` Swagger）：
 
-### 其他运行方式
-
-<details>
-<summary><b>FastAPI 服务（本地部署，方式 D）</b></summary>
-
-前置条件：本地启动 Redis（默认 `redis://localhost:6379/0`，embedding 缓存、限流与 Celery 依赖），并完成 `.env` 配置：
-
-```bash
-redis-server                      # macOS: brew services start redis
-pip install -e . -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
+```json
+{
+  "answer": "……",
+  "step_by_step_analysis": "……",
+  "relevant_pages": [57],
+  "references": ["……可溯源至 PDF 页码……"],
+  "confidence": {"overall": 0.86, "retrieval_confidence": 0.90, "faithfulness": 0.85, "completeness": 0.80},
+  "elapsed_seconds": 12.4
+}
 ```
 
-启动 API 服务：
+## 核心设计
 
-```bash
-python -m uvicorn app.main:app --host 0.0.0.0 --port 8000
-```
+### 1. 渐进式披露（工具 Schema 按需加载）
 
-启动 Celery worker（负责 PDF 解析 -> 分块 -> 向量化入库，必须与 API 服务使用同一 Redis）：
+- **问题**：多个检索工具的完整 Schema 常驻 system prompt，Token 开销随工具数线性增长。
+- **做法**：LangGraph 图先做意图识别（`select_tool`），只加载命中工具的 Schema，执行完毕即从上下文清除，再进入生成节点。
+- **收益**：上下文中同一时刻最多只有一套工具定义，工具数量不再侵蚀生成预算。
 
-```bash
-celery -A app.celery_app:celery_app worker --loglevel=info --pool=threads --concurrency=4
-```
+### 2. 两级上下文压缩
 
-> worker 需能 `import app.celery_app`，请在项目根目录启动；`--pool=threads` 适配 MinerU 同步 HTTP 轮询（I/O 密集），并发数按机器配置调整；Redis 未启动时 API 服务仍可运行（缓存与限流自动降级直连），但 `/upload` 提交异步任务会失败。
+- **问题**：30+ 轮长程对话下，工具结果全文与全部历史拼接导致 Token 爆炸、信息稀释。
+- **做法**：L1 按问题关键词对检索片段逐句打分，保留命中句及其上下文（上限 800 字，纯规则实现、不调 LLM），原文落盘备审计；L2 超过 5 轮后将早期对话合并为结构化摘要，仅保留最近 5 轮原文。
+- **收益**：单次请求 Token 8200 → 4100（口径见下表）。
 
-</details>
+### 3. 三维置信度验证 + 自动重试
 
-<details>
-<summary><b>CLI 与离线流水线（方式 A / B / C）</b></summary>
+- **问题**：检索质量差时强行生成，幻觉风险高，用户也无法判断答案可信度。
+- **做法**：每轮生成后由评估模型从检索质量、忠实度、完整度三个维度打分并加权为 overall，低于阈值自动改写查询重试，全程保留历史最优答案。
+- **收益**：幻觉率 18% → 7%（口径见下表），且每个答案自带可解释的置信度字段。
 
-CLI 分步执行（解析 PDF -> 表格序列化 -> 入库 -> 问答）、直接运行 pipeline 脚本、单条问题即时推理，以及数据准备（`subset.csv` / `questions.json`）与输出格式说明，详见 [docs/cli-guide.md](docs/cli-guide.md)。
+## 评测结果
 
-</details>
+| 指标 | 基线 | 本方案 | 相对变化 |
+|---|---|---|---|
+| 单次请求 Token（30+ 轮长程对话） | 8200 | 4100 | -50% |
+| Top-5 召回率 | 待补充 | 86.7% | — |
+| 幻觉率 | 18% | 7% | -11 pp |
 
----
+**RAGAS 回归（最新一轮实测，产物见 [data/eval/benchmark_report.json](data/eval/benchmark_report.json)）**：L1/L2 压缩关闭（baseline）vs 开启（optimized），10 题、每题独立会话、双臂逐题交错执行、判官 gpt-4o-mini：
 
-## 核心特性
+| 指标 | baseline（L1/L2 关） | optimized（L1/L2 开） | 变化（optimized - baseline） |
+|---|---|---|---|
+| faithfulness | 0.6333 | 0.5167 | -0.1166 |
+| answer_relevancy | 0.7786 | 0.751 | -0.0276 |
+| context_precision | 0.7211 | 0.6609 | -0.0602 |
+| context_recall | 0.75 | 0.7333 | -0.0167 |
+| 平均每题 input_tokens（服务端） | 3747.9 | 3373.3 | -10.0% |
+| 平均每题 final_prompt_tokens（本地估算） | 2795.1 | 2448.1 | -12.4% |
 
-### 📄 智能文档解析
+注意：单轮、10 题场景下压缩仅省约 10% token，且四项 RAGAS 指标均有下降；主表 -50% 的 Token 收益来自 30+ 轮长程对话场景，两者口径不同，不可直接比较。
 
-- **MinerU 云端解析**：PDF 解析为 Markdown + 结构化 `content_list.json`，保留真实页码、表格、图片信息。
-- **真实页码可溯源**：每条 chunk 直接读取 MinerU 返回的 `page_idx`，答案可定位到 PDF 具体页。
-- **多模态分块**：文本、表格、图片分别成块，全部可被检索。
+**口径说明**：
 
-### 🔍 混合检索增强
-
-- **混合检索**：FAISS 向量检索 + BM25 关键词检索，支持 Parent Document Retrieval。
-- **LLM 重排**：对候选 chunk 进行二次相关性打分，提升上下文质量。
-- **多公司路由**：支持单公司问答与多公司对比问答，可通过 `RunConfig` 一键切换各检索组合。
-
-### ⚙️ 企业级工程化
-
-- **Celery 异步入库**：`/upload` 立即返回 202 与 `task_id`，解析/分块/向量化后台执行，FAISS 索引并发更新加锁保护。
-- **Redis 缓存与限流**：嵌入向量 Redis 缓存（命中毫秒级）+ AGICTO 出口固定窗口限流（429），失败自动降级，详见 [docs/redis-cache.md](docs/redis-cache.md)。
-- **SQLite 持久化**：基于 `aiosqlite` 异步存储对话历史，WAL 模式优化并发，支持内存后端切换。
-- **配置热重载**：`config.json` 支持热重载，环境变量 `KB_` 前缀覆盖，详见 [docs/configuration.md](docs/configuration.md)。
-- **SSE 流式**：`/chat` 默认 SSE 逐句返回，支持客户端断开检测、keep-alive 保活与 120s 总超时，详见 [docs/sse-lifecycle.md](docs/sse-lifecycle.md)。
-- **中间件增强**：全局请求日志与统一错误处理，详见 [docs/api.md](docs/api.md)。
-
-### 🧠 可信推理
-
-- **结构化 CoT**：四段式 JSON 输出（分步推理 / 推理摘要 / 相关页面 / 最终答案），便于追溯与展示。
-- **低置信度自动重试**：答案质量低于阈值时自动改写查询并重试，支持置信度评估，配置见 `config.json`，详见 [docs/retry-loop.md](docs/retry-loop.md)。
-- **RAGAS 评估**：内置一键评估流水线，详见 [scripts/eval/](scripts/eval/) 与 [docs/evaluation.md](docs/evaluation.md)。
-
----
-
-## 技术栈
-
-| 模块 | 技术 |
-|---|---|
-| PDF 解析 | MinerU 云端 API |
-| 大模型调用 | AGICTO 平台（OpenAI 兼容接口） |
-| 文本模型 | `qwen3.8-max` |
-| 嵌入模型 | `text-embedding-v4` |
-| 向量检索 | FAISS |
-| 关键词检索 | `rank-bm25` |
-| 文本分块 | `langchain` + `tiktoken` |
-| 配置 | `python-dotenv` + `dataclass` + `aiofiles` |
-| 持久化存储 | `aiosqlite` |
-| CLI | `click` |
-| Web 服务 | FastAPI + Uvicorn |
-| 跨域 | `fastapi.middleware.cors.CORSMiddleware` |
-| 中间件 | 自定义 `RequestLoggingMiddleware` + `ErrorHandlingMiddleware` |
-| 缓存与限流 | Redis（`redis.asyncio`） |
-| 异步任务 | Celery |
-| 测试 | pytest + pytest-asyncio + pytest-cov |
-
----
+- **Token**：基线为不做任何压缩的朴素 RAG，场景为 30+ 轮长程对话。待补充：Token 统计方式（服务端 `prompt_tokens` 还是本地估算）与样本数。
+- **召回率**：混合检索（FAISS + BM25）+ LLM 重排后的 Top-5 召回率，对比对象为单路向量检索。待补充：单路向量检索基线的召回率数值、评测集构成与规模。
+- **幻觉率**：开启置信度评估 + 自动重试前后的对比。待补充：幻觉判定方法（人工标注还是 RAGAS faithfulness 阈值反推）与样本数。
+- **回归评测**：自建金融查询评测集 30 条；上表 RAGAS 回归最新一轮跑 10 题，覆盖比亚迪 / 贵州茅台 / 宁德时代 / 中芯国际年报（含 ground_truth），指标为 faithfulness / answer_relevancy / context_precision / context_recall。
 
 ## 目录结构
 
-```
-企业知识库_new/
-├── app/                        # FastAPI 服务化应用
-│   ├── main.py                 # 应用入口（lifespan 初始化、create_app 工厂、中间件挂载）
-│   ├── api.py                  # API 路由（upload / tasks / chat / history / health）
-│   └── ...                     # schemas / services / cache / rate_limiter / celery_app / tasks / storage / db / config / middleware
-├── src/                        # RAG 核心流水线
-│   ├── pipeline.py             # 主流程编排
-│   └── ...                     # pdf_mineru / text_splitter / ingestion / retrieval / reranking / query_rewriter 等
-├── scripts/eval/               # RAGAS 评估流水线（run_all.py 一键编排）
-├── tests/                      # 自动化测试（unit / integration / e2e）
-├── docs/                       # 详细文档
-├── data/stock_data/            # 数据集（pdf_reports / subset.csv / questions.json / 解析产物 / vector_dbs）
-├── config.json                 # 应用配置文件（支持运行时热重载）
-├── docker-compose.yml          # 一键编排 api / worker / redis
-├── Dockerfile
-├── main.py                     # CLI 入口（click）
-├── env                         # 环境变量模板（需重命名为 .env）
-├── requirements.txt            # 运行依赖
-├── requirements-test.txt       # 测试依赖
-├── pytest.ini                  # pytest 配置（asyncio_mode = auto）
-├── setup.py
-├── LICENSE
-└── README.md
-```
-
-> 运行时生成的 `data/chat_history.db`（SQLite 对话历史，WAL 模式）位于 `data/` 下。各模块功能说明见 [docs/src_modules_overview.md](docs/src_modules_overview.md)。
-
----
-
-## 配置说明
-
-主流程配置在 [src/pipeline.py](src/pipeline.py) 的 `RunConfig` 与预置的 `configs` 字典：
-
-| 参数 | 默认值 | 说明 |
-|---|---|---|
-| `use_serialized_tables` | `False` | 是否启用表格序列化 |
-| `parent_document_retrieval` | `False` | 是否启用父文档检索（返回整页） |
-| `use_vector_dbs` | `True` | 是否使用向量库 |
-| `use_bm25_db` | `False` | 是否使用 BM25 关键词库 |
-| `llm_reranking` | `False` | 是否启用 LLM 重排 |
-| `llm_reranking_sample_size` | `30` | LLM 重排候选数量 |
-| `top_n_retrieval` | `10` | 检索返回 top-N |
-| `parallel_requests` | `1` | 并行请求数（AGICTO 限流，建议 1） |
-| `answering_model` | `qwen3.8-max` | 文本模型 |
-| `config_suffix` | `""` | 输出文件后缀，便于区分不同实验 |
-
-预置配置：
-
-- `base`：基础配置（向量检索 + 路由 + 结构化 CoT）
-- `pdr`：在 base 基础上启用父文档检索
-- `max`：推荐最佳配置（父文档检索 + LLM 重排，`qwen3.8-max`）
-
-> 应用层配置（`STORAGE_BACKEND` / `KB_DB_PATH` / `redis.*` / `rate_limit.*` / `retry_loop.*` 等）：`config.json` 支持热重载，环境变量 `KB_` 前缀覆盖（嵌套用双下划线），详见 [docs/configuration.md](docs/configuration.md)；重试循环配置详见 [docs/retry-loop.md](docs/retry-loop.md)。
-
----
-
-## API 概览
-
-| 接口 | 方法 | 说明 |
-|---|---|---|
-| `/upload` | POST | 上传 PDF 受理入库，立即返回 202（`task_id` + `status=pending`），解析/分块/向量化由 Celery worker 后台执行 |
-| `/tasks/{task_id}` | GET | 查询 PDF 入库异步任务状态，返回 `pending` / `success` / `failure` |
-| `/chat` | POST | 核心问答接口，默认 SSE 流式逐句返回；`?stream=false` 时返回标准 JSON |
-| `/history/{session_id}` | GET | 获取指定会话的历史问答记录，不存在时返回 404 |
-| `/health` | GET | 健康检查，返回 `{"status": "ok"}` |
-
-极简调用示例：
-
-```bash
-# 上传 PDF（需指定 company_name 以便问答路由；需先启动 Redis 与 Celery worker）
-curl -X POST http://localhost:8000/upload \
-  -F "file=@研报.pdf" \
-  -F "company_name=中芯国际"
-# 响应：{"task_id": "a1b2c3d4-...", "status": "pending"}
-
-# 流式问答（SSE）：-N 关闭缓冲，逐 event 实时接收
-curl -N -X POST http://localhost:8000/chat \
-  -H "Content-Type: application/json" \
-  -d '{"session_id": "sess-01", "question": "\"中芯国际\"在晶圆制造行业中的地位如何？"}'
+```text
+enterprise_rag/
+├── app/                          # FastAPI 服务层
+│   ├── agent.py                  # LangGraph StateGraph：select→load→execute→generate
+│   ├── api.py                    # /upload /chat /history /tasks /health
+│   ├── tasks.py                  # Celery 异步任务：MinerU 解析与向量化入库
+│   ├── services.py               # Pipeline 生命周期管理
+│   ├── storage.py / db.py        # 会话存储（SQLite / 内存）
+│   ├── cache.py / rate_limiter.py  # Redis embedding 缓存与 API 限流
+│   ├── config.py                 # 配置热重载
+│   └── main.py / schemas.py / middleware.py / celery_app.py
+├── src/                          # RAG 核心链路
+│   ├── pipeline.py               # 问答主链路 + 置信度重试循环
+│   ├── retrieval.py              # FAISS + BM25 混合检索
+│   ├── reranking.py              # LLM 重排
+│   ├── context_compression.py    # L1 工具结果裁剪 + L2 历史压缩
+│   ├── retrieval_evaluator.py    # 三维置信度评估
+│   ├── query_rewriter.py         # 低置信度时的查询改写
+│   ├── pdf_mineru.py / pdf_parsing.py / ingestion.py  # 解析与入库
+│   └── prompts.py / text_splitter.py / ...
+├── scripts/eval/                 # RAGAS 评测、A/B 对比、bad case 分析脚本
+├── data/                         # 索引、解析产物、评测数据（运行时生成）
+├── docker-compose.yml            # api + worker + redis 三服务编排
+├── env                           # 环境变量模板（cp env .env）
+└── Dockerfile / requirements.txt
 ```
 
-> SSE 事件流明细（`start` / `reasoning` / `delta` / `done` / `error` 等）、错误事件示例、422 校验示例、非流式与历史查询等完整示例见 [docs/api.md](docs/api.md)。
+## 局限与 TODO
 
----
+1. **评测集规模小**：自建评测集 30 条，统计意义有限，未覆盖全部金融文档类型与问法分布。
+2. **未做线上流量验证**：全部指标来自离线评测，真实并发下的表现（吞吐、延迟分布）未测量。
+3. **仅支持 PDF 输入**：Word / HTML / 扫描件等其他格式未适配。
+4. **单一模型供应商**：embedding / LLM / 重排均依赖 AGICTO 平台，未做多 provider 故障切换。
+5. **图状态不持久化**：LangGraph 图未接 checkpointer，长程任务的断点续跑尚不支持。
 
-## RAGAS 评估
+## 许可与引用
 
-内置一键式 RAGAS 评估流水线（数据构造 -> 批量推理 -> 指标计算 -> Bad Case 分析），脚本位于 [scripts/eval/](scripts/eval/)，一键运行 `python scripts/eval/run_all.py`。指标定义、四阶段说明与结果产物详见 [docs/evaluation.md](docs/evaluation.md)。
+本项目基于 [MIT License](LICENSE) 开源。
 
----
-
-## 测试
-
-包含 55 个自动化测试，分层覆盖单元 / 集成 / E2E，所有外部依赖（MinerU、AGICTO、FAISS、Redis）均被 Mock。
-
-```bash
-python -m pytest tests/ -v
+```bibtex
+@misc{enterprise_rag_2025,
+  author = {IlyaRice},
+  title = {enterprise_rag: 面向金融研报的深度问答 Agent},
+  year = {2025},
+  url = {https://github.com/uxioaln/enterprise_rag}
+}
 ```
-
-覆盖率明细与测试结构详见 [docs/testing.md](docs/testing.md)。
-
----
-
-## 系统要求
-
-| 项目 | 要求 |
-|---|---|
-| Python | 3.10+（本地运行） |
-| Docker | Docker 24+ 与 Docker Compose v2（推荐部署方式） |
-| 内存 | 4GB+ |
-| 磁盘 | 建议预留 10GB（模型与向量索引） |
-| Redis | 本地方式 D 运行时需要（Docker Compose 已内置） |
-
----
-
-## Roadmap
-
-- [ ] 多模态图表理解：基于解析出的图片/表格进行视觉问答
-- [ ] 支持更多券商研报格式与数据源接入
-- [ ] Web UI：会话管理与答案可视化前端
-
----
-
-## Contributing
-
-欢迎提交 Issue 与 Pull Request！贡献流程与规范请参阅 [CONTRIBUTING.md](CONTRIBUTING.md)。
-
-## Changelog
-
-项目遵循 [Semantic Versioning](https://semver.org/lang/zh-CN/) 版本规范，版本变更记录见 [CHANGELOG.md](CHANGELOG.md)。
-
-## Security
-
-如发现安全漏洞，请勿直接提交公开 Issue，披露流程见 [SECURITY.md](SECURITY.md)。
-
----
-
-## 致谢
-
-本项目基于 [RAG-Challenge-2](https://github.com/IlyaRice/RAG-Challenge-2) 二次开发，原始项目为 RAG Challenge 竞赛获奖方案。
-
-在此基础上，本项目针对中文研报场景进行了适配与扩展：将 PDF 解析切换为 MinerU、模型调用统一切换为 AGICTO 平台、数据集替换为中芯国际相关研报；并新增了 FastAPI 服务化层、Celery 异步入库、Redis 缓存与限流、SQLite 持久化、配置热重载、低置信度查询改写重试、SSE 连接生命周期管理、分层自动化测试、RAGAS 评估流水线等工程化能力（详见 [docs/](docs/)）。
-
----
-
-## License
-
-MIT，详见 [LICENSE](LICENSE)。

@@ -59,6 +59,7 @@ class ChatResponse(BaseModel):
     session_id: str
     question: str
     answer: str = ""
+    answer_statement: str = ""
     step_by_step_analysis: str = ""
     reasoning_summary: str = ""
     relevant_pages: List[Any] = []

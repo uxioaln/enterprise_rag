@@ -27,7 +27,7 @@ class BaseOpenaiProcessor:
         load_dotenv()
         llm = OpenAI(
             api_key=os.getenv("OPENAI_API_KEY"),
-            timeout=None,
+            timeout=300,  # chat 生成类调用超时 300 秒，避免服务端挂起时无限等待
             max_retries=2
             )
         return llm
@@ -129,7 +129,8 @@ class BaseIBMAPIProcessor:
         }
         
         try:
-            response = requests.post(embeddings_url, headers=headers, json=payload)
+            # embedding 调用超时 60 秒，避免服务端挂起时无限等待
+            response = requests.post(embeddings_url, headers=headers, json=payload, timeout=60)
             response.raise_for_status()
             return response.json()
         except requests.HTTPError as err:
@@ -181,7 +182,8 @@ class BaseIBMAPIProcessor:
         }
         
         try:
-            response = requests.post(text_generation_url, headers=headers, json=payload)
+            # 文本生成调用超时 300 秒，避免服务端挂起时无限等待
+            response = requests.post(text_generation_url, headers=headers, json=payload, timeout=300)
             response.raise_for_status()
             completion = response.json()
 
@@ -409,13 +411,43 @@ class APIProcessor:
             **kwargs
         )
 
-    def get_answer_from_rag_context(self, question, rag_context, schema, model):
-        system_prompt, response_format, user_prompt = self._build_rag_context_prompts(schema)
-        
+    def get_answer_from_rag_context(self, question, rag_context, schema, model, history=None,
+                                    history_keep_rounds: int = 5):
+        raw_system_prompt, response_format, user_prompt = self._build_rag_context_prompts(schema)
+
+        # 分层上下文组装（System Prompt / 动态附件 / 对话历史 各为独立层模块）：
+        # - 系统提示层：现有 prompt 原样透传（from_raw_prompt 兼容，行为不变）；
+        # - 动态附件层：上游已拼好的 rag_context 作为单一块透传（from_raw_context 兼容）；
+        # - 对话历史层：history 渲染为"问/答"前情提要，超过 keep_rounds 轮时早期轮自动摘要注入。
+        # history_keep_rounds（A/B 实验透传）：ours=5 摘要注入（L2 压缩），
+        # baseline=极大值全量保留；默认 5 与原行为一致。
+        from src.context_layers import (
+            LayeredContextBuilder, SystemPromptLayer,
+            DynamicAttachmentsLayer, ConversationHistoryLayer,
+        )
+        builder = LayeredContextBuilder()
+        builder.add_layer(SystemPromptLayer.from_raw_prompt(raw_system_prompt))
+        builder.add_layer(DynamicAttachmentsLayer.from_raw_context(rag_context))
+        builder.add_layer(ConversationHistoryLayer(history, keep_rounds=history_keep_rounds))
+        assembled = builder.build()
+
+        # 多轮上下文保持：历史层文本拼到 question 前面（一起塞进 {question} 占位符），
+        # 历史不进 system prompt、不进检索上下文，仅作为问题的前情提要，保持职责分离。
+        effective_question = question
+        if assembled["question_prefix"]:
+            effective_question = assembled["question_prefix"] + f"\n\n本轮问题：\n{question}"
+
+        # 调用LLM前先拼出最终完整 user prompt（仅拼一次，发送与 token 统计共用同一字符串）
+        final_user_prompt = user_prompt.format(context=assembled["context"], question=effective_question)
+        # 统计最终上下文Token数：system + user 整体用 tiktoken 编码计数
+        # （复用 BaseOpenaiProcessor.count_tokens，o200k_base 编码，与分块侧口径一致）
+        context_tokens = BaseOpenaiProcessor.count_tokens(assembled["system"] + final_user_prompt)
+        print(f"[上下文Token统计] 本轮 final_prompt tokens={context_tokens}")
+
         answer_dict = self.processor.send_message(
             model=model,
-            system_content=system_prompt,
-            human_content=user_prompt.format(context=rag_context, question=question),
+            system_content=assembled["system"],
+            human_content=final_user_prompt,
             is_structured=True,
             response_format=response_format
         )
@@ -439,7 +471,8 @@ class APIProcessor:
                             "step_by_step_analysis": answer_dict.get("step_by_step_analysis", ""),
                             "reasoning_summary": answer_dict.get("reasoning_summary", ""),
                             "relevant_pages": answer_dict.get("relevant_pages", []),
-                            "final_answer": answer_dict.get("final_answer", "N/A")
+                            "final_answer": answer_dict.get("final_answer", "N/A"),
+                            "answer_statement": answer_dict.get("answer_statement", "")
                         }
                 else:
                     # 否则使用兜底结构
@@ -447,16 +480,26 @@ class APIProcessor:
                         "step_by_step_analysis": answer_dict.get("step_by_step_analysis", ""),
                         "reasoning_summary": answer_dict.get("reasoning_summary", ""),
                         "relevant_pages": answer_dict.get("relevant_pages", []),
-                        "final_answer": answer_dict.get("final_answer", "N/A")
+                        "final_answer": answer_dict.get("final_answer", "N/A"),
+                        "answer_statement": answer_dict.get("answer_statement", "")
                     }
             else:
-                # 如果不是预期格式，进行兜底
+                # 如果不是预期格式，则进行兜底
                 answer_dict = {
                     "step_by_step_analysis": "",
                     "reasoning_summary": "",
                     "relevant_pages": [],
-                    "final_answer": "N/A"
+                    "final_answer": "N/A",
+                    "answer_statement": ""
                 }
+        # 将本轮 final_prompt 的 token 数随答案带回上层，
+        # 供 process_chat 维护"平均上下文Token数"统计（放在兜底之后，保证字段不丢失）
+        answer_dict["context_tokens"] = context_tokens
+        # A/B 实验新增：回传服务端真实 token 用量（优先取值口径，tiktoken 估算仅作兜底）。
+        # response_data 由底层 processor.send_message 写入，四个处理器字段名统一为
+        # {"model", "input_tokens", "output_tokens"}；同样放在兜底之后，保证字段不丢失
+        answer_dict["prompt_tokens"] = self.response_data.get("input_tokens")
+        answer_dict["completion_tokens"] = self.response_data.get("output_tokens")
         return answer_dict
 
 
@@ -676,7 +719,7 @@ class BaseDashscopeProcessor:
         load_dotenv()
         self.api_key = os.getenv("AGICTO_API_KEY")
         self.base_url = "https://api.agicto.cn/v1"
-        self.default_model = 'qwen3.8-max'
+        self.default_model = 'qwen-plus'
         self.llm = self.set_up_llm()
 
     def set_up_llm(self):
@@ -684,13 +727,13 @@ class BaseDashscopeProcessor:
         return OpenAI(
             api_key=self.api_key,
             base_url=self.base_url,
-            timeout=None,
+            timeout=300,  # chat 生成类调用超时 300 秒，避免 AGICTO 挂起时无限等待
             max_retries=2
         )
 
     def send_message(
         self,
-        model="qwen3.8-max",
+        model="qwen-plus",
         temperature=0.1,
         seed=None,  # 兼容参数，暂不使用
         system_content='You are a helpful assistant.',
@@ -774,7 +817,7 @@ class BaseDashscopeProcessor:
 # 超过会返回 HTTP 200 但 data 为 null（batch size is invalid），故此处必须为 10
 _AGICTO_EMBED_BATCH_SIZE = 10
 # AGICTO 默认模型
-AGICTO_DEFAULT_CHAT_MODEL = "qwen3.8-max"
+AGICTO_DEFAULT_CHAT_MODEL = "qwen-plus"
 AGICTO_DEFAULT_EMBEDDING_MODEL = "text-embedding-v4"
 
 # 模块级懒加载客户端（复用 HTTP 连接池）
@@ -790,7 +833,7 @@ def _get_agicto_client() -> OpenAI:
         _agicto_client = OpenAI(
             api_key=os.getenv("AGICTO_API_KEY"),
             base_url="https://api.agicto.cn/v1",
-            timeout=None,
+            timeout=300,  # chat 生成类调用超时 300 秒，避免 AGICTO 挂起时无限等待
             max_retries=2
         )
     return _agicto_client
@@ -804,7 +847,7 @@ def _get_agicto_async_client() -> AsyncOpenAI:
         _agicto_async_client = AsyncOpenAI(
             api_key=os.getenv("AGICTO_API_KEY"),
             base_url="https://api.agicto.cn/v1",
-            timeout=None,
+            timeout=300,  # chat 生成类调用超时 300 秒，避免 AGICTO 挂起时无限等待
             max_retries=2
         )
     return _agicto_async_client

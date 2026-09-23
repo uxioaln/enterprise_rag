@@ -114,7 +114,7 @@ def evaluate(
     query: str,
     docs: List[str],
     answer: dict,
-    model: str = "qwen3.8-max",
+    model: str = "qwen-plus",
 ) -> ConfidenceScore:
     """评估 (query, docs, answer) 三元组的整体质量。
 
@@ -128,7 +128,7 @@ def evaluate(
         query：用户原始问题
         docs：检索到的文档片段列表
         answer：Pipeline 生成的结构化答案 dict（含 final_answer / reasoning_summary 等）
-        model：评估使用的模型名，默认 qwen3.8-max
+        model：评估使用的模型名，默认 qwen-plus
 
     返回：
         ConfidenceScore 结构化评分

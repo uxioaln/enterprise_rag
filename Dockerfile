@@ -74,8 +74,12 @@ COPY scripts/ ./scripts/
 COPY main.py config.json ./
 
 # pyprojroot.here() 以 requirements.txt 等文件定位项目根，/app 已满足；
-# 创建 data 子目录，保证未挂载卷时 Pipeline 初始化目录不报错
-RUN mkdir -p /app/data/stock_data
+# 创建 data 子目录，保证未挂载卷时 Pipeline 初始化目录不报错：
+# - stock_data：FAISS 向量库 / BM25 / 解析产物（worker 入库、api 检索共用）
+# - retrieved_docs：L1 工具结果裁剪（src/context_compression.py）的完整原文
+#   落盘目录，app/config.py 的 l1_store_dir 默认指向 data/retrieved_docs；
+#   挂载 ./data 卷后自动随卷持久化
+RUN mkdir -p /app/data/stock_data /app/data/retrieved_docs
 
 # -------------------------------------------------------------------------
 # 模型预下载：tiktoken 编码表

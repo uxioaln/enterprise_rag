@@ -165,6 +165,8 @@ async def chat(
             session_id=body.session_id,
             question=body.question,
             answer=answer_dict.get("final_answer", ""),
+            # 完整陈述句版答案：供评测（RAGAS faithfulness 拆句）与展示使用
+            answer_statement=answer_dict.get("answer_statement", ""),
             step_by_step_analysis=answer_dict.get("step_by_step_analysis", ""),
             reasoning_summary=answer_dict.get("reasoning_summary", ""),
             relevant_pages=answer_dict.get("relevant_pages", []),

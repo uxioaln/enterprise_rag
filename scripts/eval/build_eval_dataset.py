@@ -47,17 +47,22 @@ def _resolve_answers_file() -> Optional[Path]:
     return None
 
 
-def _extract_records(raw: dict) -> list[dict]:
+def _extract_records(raw) -> list[dict]:
     """从答案文件中提取 (question, ground_truth, kind) 记录列表。
 
-    兼容两种格式：
+    兼容三种格式：
       1. 提交格式：{"answers": [{"question_text", "kind", "value", ...}]}
       2. 原始格式：{"questions": [{"question_text"/"question", "value"/"answer"/"final_answer", "kind"}]}
+      3. 顶层数组格式：[{"question", "type", "answer", "page_num"}]（人工标注文件 answer_max.json）
     """
-    # 优先取 answers 数组，其次 questions 数组
-    items = raw.get("answers")
-    if not isinstance(items, list):
-        items = raw.get("questions")
+    # 顶层即数组：直接作为条目列表处理
+    if isinstance(raw, list):
+        items = raw
+    else:
+        # 优先取 answers 数组，其次 questions 数组
+        items = raw.get("answers")
+        if not isinstance(items, list):
+            items = raw.get("questions")
     if not isinstance(items, list):
         return []
 

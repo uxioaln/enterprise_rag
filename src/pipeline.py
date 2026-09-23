@@ -1,5 +1,5 @@
 # AGICTO 平台（OpenAI 兼容接口）调用大模型
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from pyprojroot import here
 import logging
@@ -69,19 +69,32 @@ class RunConfig:
     llm_reranking: bool = False
     llm_reranking_sample_size: int = 30
     top_n_retrieval: int = 10
-    parallel_requests: int = 1 # 并行的数量，需要限制，否则qwen3.8-max会超出阈值
+    parallel_requests: int = 1 # 并行的数量，需要限制，否则qwen-plus会超出阈值
     pipeline_details: str = ""
     submission_file: bool = True
     full_context: bool = False
     api_provider: str = "dashscope" #openai
-    answering_model: str = "qwen3.8-max" # gpt-4o-mini-2024-07-18 or "gpt-4o-2024-08-06"
+    answering_model: str = "qwen-plus" # gpt-4o-mini-2024-07-18 or "gpt-4o-2024-08-06"
     config_suffix: str = ""
     # 低置信度自动查询改写重试配置
     enable_retry_loop: bool = False
     max_retries: int = 2
     confidence_threshold: float = 0.8
-    retry_eval_model: str = "qwen3.8-max"
-    retry_rewrite_model: str = "qwen3.8-max"
+    retry_eval_model: str = "qwen-plus"
+    retry_rewrite_model: str = "qwen-plus"
+    # Context Engineering A/B 实验开关（默认全 False，保证 base/pdr/max 既有行为不变）
+    # 五层分离：SystemPrompt/ToolDefinition/ProjectContext/ConversationHistory/DynamicAttachments
+    enable_context_layers: bool = False
+    # L1 工具结果裁剪：检索文档仅保留前200字摘要，完整内容落盘按文档ID回读
+    enable_l1_compression: bool = False
+    # L2 历史对话压缩：对话超过 5 轮后，早期轮合并为规则化摘要
+    enable_l2_compression: bool = False
+    # 动态加载：工具 Schema 按需激活（渐进式披露），调用结束后清理
+    enable_dynamic_tool_loading: bool = False
+    # 对话历史保留轮数（L2 透传给 ConversationHistoryLayer 的 keep_rounds）：
+    # 超过该轮数时早期轮合并为摘要；设为极大值表示全量保留（A/B 对照组用）。
+    # 默认 5 与 ConversationHistoryLayer 现状一致，base/pdr/max 行为不变。
+    history_keep_rounds: int = 5
 
 class Pipeline:
     def __init__(self, root_path: Path, subset_name: str = "subset.csv", questions_file_name: str = "questions.json", pdf_reports_dir_name: str = "pdf_reports", run_config: RunConfig = RunConfig()):
@@ -176,9 +189,9 @@ class Pipeline:
             print(f"本地 PDF 文件不存在: {local_pdf_path}")
             return
         print(f"开始处理: {file_name}")
-        batch_id = pdf_mineru.get_batch_id(str(local_pdf_path))
-        print(f"batch_id: {batch_id}")
-        extract_dir = pdf_mineru.get_result(batch_id)
+        # 大文件分段解析入口：≤200 页走单段；>200 页按 200 页分段循环并合并
+        # 返回的 extract_dir 与原 get_result 一致：含 full.md / content_list / images
+        extract_dir = pdf_mineru.parse_pdf(str(local_pdf_path))
         if not extract_dir or not os.path.isdir(extract_dir):
             print(f"未找到解压目录: {extract_dir}")
             return
@@ -392,10 +405,12 @@ class Pipeline:
         pages = [r.get("page", 0) for r in retrieval_results]
         return contexts, pages
 
-    def _generate_answer(self, question: str, contexts: list[str], kind: str = "string") -> dict:
+    def _generate_answer(self, question: str, contexts: list[str], kind: str = "string",
+                         history: list[dict] | None = None) -> dict:
         """根据上下文生成答案，返回结构化 answer_dict。
         复用本线程 _retrieve_contexts 缓存的检索结果与公司名，确保页码校验与引用提取
         行为与原 answer_single_question 一致；多公司比较则委托原比较流程。
+        history 透传给 generate_answer_from_contexts，用于拼入多轮上下文。
         """
         t0 = time.time()
         processor = self._new_single_question_processor()
@@ -413,7 +428,16 @@ class Pipeline:
                 contexts,
                 kind,
                 company_name=company_name,
-                retrieval_results=retrieval_results
+                retrieval_results=retrieval_results,
+                history=history,
+                # A/B 实验开关透传（第五步接线）：
+                # enable_l1 非None时覆盖 config.json 的在线开关——
+                #   baseline 强制 False（全量上下文）、ours 强制 True（摘要+落盘回读）；
+                #   其余配置传 RunConfig 默认值 False，与 config.json 默认一致，行为不变。
+                enable_l1=self.run_config.enable_l1_compression,
+                # L2 对话历史保留轮数：ours 默认5（早期轮摘要注入），
+                # baseline 10**9（全量保留），base/pdr/max 默认5（现状不变）
+                history_keep_rounds=self.run_config.history_keep_rounds,
             )
         t1 = time.time()
         print(f"[计时] 生成答案耗时: {t1-t0:.2f} 秒")
@@ -422,16 +446,19 @@ class Pipeline:
             setattr(self._tl, _k, None)
         return answer
 
-    def answer_with_contexts(self, question: str, kind: str = "string") -> tuple[dict, list[str]]:
+    def answer_with_contexts(self, question: str, kind: str = "string",
+                             history: list[dict] | None = None) -> tuple[dict, list[str]]:
         """单条问题推理，返回 (answer_dict, contexts_text_list)。
         contexts_text_list 为纯文本列表，顺序与 Prompt 中一致，供 RAGAS 评估使用。
         内部调用 _retrieve_contexts 与 _generate_answer 两个方法。
         若 RunConfig.enable_retry_loop 为 True，则包进低置信度自动查询改写重试循环。
+        history 为前序多轮问答记录（list[dict]，每项含 question/final_answer 字段），
+        不为空时拼入 LLM 的 user 消息，使本轮能感知上一轮交互（多轮上下文保持）。
         """
         # 未启用重试循环：保持原有单趟逻辑
         if not self.run_config.enable_retry_loop:
             contexts, _pages = self._retrieve_contexts(question)
-            answer_dict = self._generate_answer(question, contexts, kind)
+            answer_dict = self._generate_answer(question, contexts, kind, history=history)
             return answer_dict, contexts
 
         # 启用重试循环：retrieve -> generate -> evaluate -> 判断阈值 -> rewrite
@@ -530,16 +557,35 @@ class Pipeline:
         }
         return best_answer_dict, best_contexts
 
-    def answer_single_question(self, question: str, kind: str = "string"):
+    def answer_with_tools(self, question: str, kind: str = "string",
+                           history: list[dict] | None = None) -> dict:
+        """工具按需加载 Agent 路径（参考 deer-flow Skills 渐进式披露三步走）。
+
+        Step1 意图识别：模型仅根据工具菜单（名称+简要描述）选工具，此时不加载详细参数；
+        Step2 动态加载：确认工具后从目录加载完整Schema（参数+返回值）并执行检索；
+        Step3 上下文清理：执行后剔除完整Schema，仅保留调用结果摘要用于最终回答。
+        复用 _new_single_question_processor，与 MinerU 分块库和 AGICTO 调用保持兼容。
+        （本方法为问答唯一服务链路；answer_with_contexts 保留为评估脚本与库级底层接口。）
+        history 透传给 ToolAgent.answer，在 generate 节点拼入多轮上下文。
+        """
+        # 延迟导入，避免 src -> app 的加载期依赖
+        from app.agent import ToolAgent
+        processor = self._new_single_question_processor()
+        agent = ToolAgent(processor=processor, model=self.run_config.answering_model)
+        answer_dict, _contexts = agent.answer(question, kind, history=history)
+        return answer_dict
+
+    def answer_single_question(self, question: str, kind: str = "string",
+                               history: list[dict] | None = None):
         """
         单条问题即时推理，返回结构化答案（dict）。
-        重构后内部调用 _retrieve_contexts 与 _generate_answer，保持原有签名与返回值不变。
-        若 RunConfig.enable_retry_loop 为 True，answer_with_contexts 内部自动启用重试循环，
-        返回的 answer_dict 将额外包含 confidence 和 retry_metadata 字段。
+        服务链路唯一入口：始终走工具按需加载 Agent 图（answer_with_tools）。
         kind: 支持 'string'、'number'、'boolean'、'names' 等
+        history: 前序多轮问答记录（list[dict]，每项含 question/final_answer 字段），
+                不为空时拼入 LLM 的 user 消息，使本轮能感知上一轮交互。
         """
         t0 = time.time()
-        answer_dict, _contexts = self.answer_with_contexts(question, kind=kind)
+        answer_dict = self.answer_with_tools(question, kind=kind, history=history)
         t1 = time.time()
         print(f"[计时] answer_single_question 总耗时: {t1-t0:.2f} 秒")
         return answer_dict
@@ -570,15 +616,36 @@ max_config = RunConfig(
     llm_reranking=True,
     parallel_requests=4,
     submission_file=True,
-    pipeline_details="Custom pdf parsing + vDB + Router + Parent Document Retrieval + reranking + SO CoT; llm = qwen3.8-max",
-    answering_model="qwen3.8-max",
+    pipeline_details="Custom pdf parsing + vDB + Router + Parent Document Retrieval + reranking + SO CoT; llm = qwen-plus",
+    answering_model="qwen-plus",
     config_suffix="_kimi_k2_5"
+)
+
+# ==================== A/B Test 实验配置 ====================
+# 对照组（Baseline）：原始 RAG 链路（全量上下文，无压缩，无动态加载）。
+# 用 replace 复制 base_config 仅改 suffix，参数与 base 完全一致，
+# 独立命名避免污染历史 base 评测数据。
+# history_keep_rounds 设为极大值：对照组历史全量保留（不摘要），符合"无压缩"定义。
+baseline_config = replace(base_config, config_suffix="_baseline", history_keep_rounds=10**9)
+
+# 实验组（Ours）：Context Engineering 优化版（五层分离 + 动态加载 + 两级压缩）。
+# 同样基于 base_config 派生，保证与 baseline 的差异只来自上下文工程开关本身。
+ours_config = replace(
+    base_config,
+    pipeline_details="Context Engineering: layered context + dynamic loading + L1/L2 compression",
+    config_suffix="_ours",
+    enable_context_layers=True,        # 五层分离：分层组装 system/context/question_prefix
+    enable_l1_compression=True,        # L1 工具结果裁剪：摘要 + 落盘回读
+    enable_l2_compression=True,        # L2 历史对话压缩：早期轮规则化摘要
+    enable_dynamic_tool_loading=True,  # 动态加载：工具 Schema 渐进式披露
 )
 
 
 configs = {"base": base_config,
            "pdr": parent_document_retrieval_config,
-           "max": max_config}
+           "max": max_config,
+           "baseline": baseline_config,
+           "ours": ours_config}
 
 
 # 你可以直接在本文件中运行任意方法：
@@ -591,8 +658,10 @@ if __name__ == "__main__":
     print('root_path:', root_path)
     #print(type(root_path))
     # 初始化主流程，使用推荐的最佳配置
-    pipeline = Pipeline(root_path, run_config=max_config)
-    
+    #pipeline = Pipeline(root_path, run_config=base_config)
+    pipeline = Pipeline(root_path, run_config=parent_document_retrieval_config)
+    #pipeline = Pipeline(root_path, run_config=max_config)
+
     print('1. 将pdf转化为纯markdown文本')#使用mineru的云端解析结果下载得到压缩包，解压后得到的文件为md格式
     # 遍历 pdf_reports 目录下所有 PDF 文件，依次调用 export_reports_to_markdown
     pdf_reports_dir = pipeline.paths.pdf_reports_dir
@@ -612,6 +681,7 @@ if __name__ == "__main__":
     
     # 7. 处理问题并生成答案，具体逻辑取决于 run_config
     # 默认questions.json
+ 
     print('4. 处理问题并生成答案，具体逻辑取决于 run_config')
     pipeline.process_questions() 
     

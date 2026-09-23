@@ -19,7 +19,7 @@ EVAL_DIR = PROJECT_ROOT / "data" / "eval"
 # AGICTO 平台 OpenAI 兼容接口
 AGICTO_BASE_URL = "https://api.agicto.cn/v1"
 # RAGAS 判官模型：使用 gpt-4o-mini（非思维链模型），
-# qwen3.8-max 是思维链模型，RAGAS faithfulness/context_precision 的长 prompt 会导致推理超时
+# qwen-plus 是思维链模型，RAGAS faithfulness/context_precision 的长 prompt 会导致推理超时
 LLM_MODEL = "gpt-4o-mini"
 EMBEDDING_MODEL = "text-embedding-v4"
 

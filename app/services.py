@@ -86,14 +86,23 @@ class PipelineService:
 
     # ---------- 问答 ----------
 
-    def answer_question_sync(self, question: str, kind: str = "string") -> dict:
-        """同步调用 Pipeline 单问推理，返回结构化答案（在线程池中执行）"""
-        return self.pipeline.answer_single_question(question, kind=kind)
+    def answer_question_sync(self, question: str, kind: str = "string",
+                             history: list[dict] | None = None) -> dict:
+        """同步调用 Pipeline 单问推理，返回结构化答案（在线程池中执行）。
+        history 为前序多轮问答记录，透传给 Pipeline.answer_single_question，
+        使本轮推理能感知上一轮交互。
+        """
+        return self.pipeline.answer_single_question(question, kind=kind, history=history)
 
-    async def answer_question(self, question: str, kind: str = "string") -> dict:
-        """异步包装：把同步的 Pipeline 推理放到线程池，避免阻塞事件循环"""
+    async def answer_question(self, question: str, kind: str = "string",
+                              history: list[dict] | None = None) -> dict:
+        """异步包装：把同步的 Pipeline 推理放到线程池，避免阻塞事件循环。
+        history 透传给同步实现，用于多轮上下文保持。
+        """
         loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(None, lambda: self.answer_question_sync(question, kind))
+        return await loop.run_in_executor(
+            None, lambda: self.answer_question_sync(question, kind, history)
+        )
 
     # ---------- 流式输出（基于 openai 原生异步流式迭代器） ----------
 
@@ -243,6 +252,12 @@ class PipelineService:
         return self._vectorize_single_report(file_name)
 
 
+# 上下文Token统计：累计各轮 final_prompt 的 token 数，用于输出"平均上下文Token数"。
+# token 数在 api_requests.get_answer_from_rag_context 调用LLM前用 tiktoken 统计，
+# 经 answer_dict["context_tokens"] 带回 process_chat；进程内存累计，服务重启后清零。
+_context_token_stats = {"rounds": 0, "total_tokens": 0}
+
+
 async def process_chat(
     service: PipelineService,
     storage,
@@ -279,9 +294,37 @@ async def process_chat(
 
     # ---- 阶段一：推理（受总超时约束） ----
     try:
+        # 多轮上下文保持：先读出当前 session 的前序问答历史，传给推理链路，
+        # 使本轮能感知上一轮交互。history 为空列表时等同于无历史（首轮问答）。
+        history = await storage.get_history(session_id)
+
+        # L2 历史对话压缩（config.json context_compression.enable_l2 开关，默认关闭）：
+        # 超过保留窗口时，早期轮合并为一条摘要（纯规则，不调 LLM），仅最近 N 轮完整保留；
+        # 关闭时透传原始历史，链路行为与接入前完全一致（便于 A/B 对比接入效果）。
+        from app.config import get_config
+        cc_cfg = get_config().context_compression
+        if cc_cfg.enable_l2 and history:
+            from src.context_compression import L2HistoryCompressor, Message
+            l2 = L2HistoryCompressor(max_rounds=cc_cfg.l2_max_rounds)
+            # 第 1 步：存储记录映射为 Message 序列（user/assistant 交替）
+            msgs: list = []
+            for r in history:
+                msgs.append(Message(role="user", content=r.get("question", "")))
+                msgs.append(Message(role="assistant", content=r.get("final_answer", "")))
+            # 第 2 步：超窗自动压缩（早期轮合并为 1 条摘要，最近 N 轮原样保留）
+            # 第 3 步：转回 history 格式（摘要消息作为首条"问/答"对，无前置 user 时用占位问题）
+            history, pending_q = [], None
+            for m in l2.compress(msgs):
+                if m.role == "user":
+                    pending_q = m.content
+                else:
+                    history.append({"question": pending_q or "[对话历史摘要]",
+                                    "final_answer": m.content})
+                    pending_q = None
+
         remaining = max(1.0, deadline - time.time())
         answer_dict = await asyncio.wait_for(
-            service.answer_question(question), timeout=remaining
+            service.answer_question(question, history=history), timeout=remaining
         )
     except asyncio.TimeoutError:
         yield format_sse("error", {"type": "timeout", "message": "模型服务响应超时，请重试"})
@@ -301,6 +344,23 @@ async def process_chat(
         return
 
     elapsed = time.time() - t0
+
+    # 上下文Token统计：取出下游在调用LLM前统计的 final_prompt token 数，维护运行平均；
+    # 用 pop 移除该内部字段，避免混入后续 done 事件与会话历史写入
+    ctx_tokens = answer_dict.pop("context_tokens", None)
+    # A/B 实验新增：服务端真实 token 用量同样 pop 移除，避免混入 done 事件与会话历史；
+    # 批量评测链路（batch_generate）在 pop 之前的 answer_dict 原始返回中读取该字段
+    real_prompt_tokens = answer_dict.pop("prompt_tokens", None)
+    real_completion_tokens = answer_dict.pop("completion_tokens", None)
+    if isinstance(ctx_tokens, int):
+        _context_token_stats["rounds"] += 1
+        _context_token_stats["total_tokens"] += ctx_tokens
+        _avg_tokens = _context_token_stats["total_tokens"] / _context_token_stats["rounds"]
+        logger.info(
+            "[上下文Token统计] 本轮=%d tokens (服务端真实: prompt=%s, completion=%s), 累计轮数=%d, 平均上下文=%.0f tokens",
+            ctx_tokens, real_prompt_tokens, real_completion_tokens,
+            _context_token_stats["rounds"], _avg_tokens,
+        )
 
     # ---- 重试循环元数据推送（仅在启用重试循环且发生多轮时推送）----
     retry_meta = answer_dict.get("retry_metadata")
@@ -436,6 +496,9 @@ async def process_chat(
             "answer": final_answer,
             "relevant_pages": answer_dict.get("relevant_pages", []),
             "references": answer_dict.get("references", []),
+            # Agent 链路工具调用轨迹（选中的工具名 + 参数摘要，不含完整 Schema），
+            # 让客户端在首个 done 事件即可看到 Agent 行为；非 Agent 来源缺省为空列表
+            "tool_trace": answer_dict.get("tool_trace", []),
             "elapsed_seconds": round(elapsed, 2),
             "confidence": answer_dict.get("confidence"),
             "retry_metadata": answer_dict.get("retry_metadata"),

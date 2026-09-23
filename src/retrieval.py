@@ -38,7 +38,10 @@ class BM25Retriever:
         bm25_path = self.bm25_db_dir / f"{document['metainfo']['sha1']}.pkl"
         with open(bm25_path, 'rb') as f:
             bm25_index = pickle.load(f)
-            
+
+        # 检索结果实际所属文档的文件名，供引用提取使用（同一公司存在多个文件时可区分来源）
+        source_file_name = document.get("metainfo", {}).get("file_name", "")
+
         # 获取文档内容和BM25索引
         document = document
         chunks = document["content"]["chunks"]
@@ -65,14 +68,16 @@ class BM25Retriever:
                     result = {
                         "distance": score,
                         "page": parent_page["page"],
-                        "text": parent_page["text"]
+                        "text": parent_page["text"],
+                        "file_name": source_file_name
                     }
                     retrieval_results.append(result)
             else:
                 result = {
                     "distance": score,
                     "page": chunk["page"],
-                    "text": chunk["text"]
+                    "text": chunk["text"],
+                    "file_name": source_file_name
                 }
                 retrieval_results.append(result)
         
@@ -96,7 +101,7 @@ class VectorRetriever:
         if self.embedding_provider == "openai":
             llm = OpenAI(
                 api_key=os.getenv("OPENAI_API_KEY"),
-                timeout=None,
+                timeout=60,  # embedding 调用超时 60 秒，避免服务端挂起时无限等待
                 max_retries=2
             )
             return llm
@@ -105,7 +110,7 @@ class VectorRetriever:
             llm = OpenAI(
                 api_key=os.getenv("AGICTO_API_KEY"),
                 base_url="https://api.agicto.cn/v1",
-                timeout=None,
+                timeout=60,  # embedding 调用超时 60 秒，避免 AGICTO 挂起时无限等待
                 max_retries=2
             )
             return llm
@@ -137,7 +142,7 @@ class VectorRetriever:
         load_dotenv()
         llm = OpenAI(
             api_key=os.getenv("OPENAI_API_KEY"),
-            timeout=None,
+            timeout=60,  # embedding 调用超时 60 秒，避免服务端挂起时无限等待
             max_retries=2
         )
         return llm
@@ -219,6 +224,8 @@ class VectorRetriever:
         vector_db = target_report["vector_db"]
         chunks = document["content"]["chunks"]
         pages = document["content"].get("pages", [])
+        # 检索结果实际所属文档的文件名，供引用提取使用（同一公司存在多个文件时可区分来源）
+        source_file_name = document.get("metainfo", {}).get("file_name", "")
         actual_top_n = min(top_n, len(chunks))
         # 获取 query 的 embedding，支持 openai/dashscope
         embedding = self._get_embedding(query)
@@ -238,14 +245,16 @@ class VectorRetriever:
                     result = {
                         "distance": distance,
                         "page": parent_page["page"],
-                        "text": parent_page["text"]
+                        "text": parent_page["text"],
+                        "file_name": source_file_name
                     }
                     retrieval_results.append(result)
             else:
                 result = {
                     "distance": distance,
                     "page": chunk.get("page", 0),
-                    "text": chunk["text"]
+                    "text": chunk["text"],
+                    "file_name": source_file_name
                 }
                 retrieval_results.append(result)
         return retrieval_results
@@ -268,13 +277,16 @@ class VectorRetriever:
         
         document = target_report["document"]
         pages = document["content"]["pages"]
-        
+        # 检索结果实际所属文档的文件名，供引用提取使用（同一公司存在多个文件时可区分来源）
+        source_file_name = document.get("metainfo", {}).get("file_name", "")
+
         all_pages = []
         for page in sorted(pages, key=lambda p: p["page"]):
             result = {
                 "distance": 0.5,
                 "page": page["page"],
-                "text": page["text"]
+                "text": page["text"],
+                "file_name": source_file_name
             }
             all_pages.append(result)
             
