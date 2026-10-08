@@ -16,15 +16,11 @@
        服务端负载/时段差异（此前"整段跑完 baseline 再跑 optimized"会让
        optimized 撞上 AGICTO 高峰时段，时延对比被服务端排队污染——上一轮
        benchmark 中 Q7 单题 +478s 即为该假信号）；单模式则单服务整 pass 执行；
-    5. 质量评估：调用 RAGAS 四项指标（判官 gpt-4o-mini 且 temperature=0，
-       复用 run_ragas 的 evaluator 配置），每指标重复评估 --ragas-repeats 次
-       取均值压低判官采样噪声；response 口径分指标处理——faithfulness/
-       context_* 优先用陈述句 answer_statement，answer_relevancy 用完整
-       answer（短陈述句缺关键数字会系统性拉低 relevancy）；
+    5. 质量评估：调用 RAGAS 四项指标（判官 gpt-4o-mini，复用 run_ragas 的
+       evaluator 配置），对两模式的 API 答案分别打分；
     6. 生成报告：data/eval/benchmark_report.json + benchmark_report.md，
-       以表格对比优化前后的质量与效率数据，并附逐题配对差值的 95% 置信
-       区间（CI 含 0 = 两臂差异不显著，无法与判官噪声区分）；
-       结束后停止服务（config.json 全程不被修改，无需恢复）。
+       以表格对比优化前后的质量与效率数据；结束后停止服务
+       （config.json 全程不被修改，无需恢复）。
 
 模式说明：
     baseline   优化前：KB_CONTEXT_COMPRESSION__ENABLE_L1/L2 = false（全量上下文）
@@ -59,6 +55,9 @@ from pathlib import Path
 
 import requests
 from dotenv import load_dotenv
+
+# t 分布分位数：配对差值 95% 置信区间用（scipy 为 ragas 依赖链中的既有库）
+from scipy import stats as _scipy_stats
 
 # 定位项目根目录与脚本目录并加入 sys.path：
 # 前者保证 import src.*，后者保证复用同目录 build_eval_dataset / run_ragas
@@ -392,91 +391,88 @@ def _run_interleaved(questions: list[dict], company_names: list[str],
 
 
 def _eval_ragas(records: list[dict], contexts_map: dict, llm, embeddings,
-                repeats: int = 3) -> None:
-    """对一批 API 答案计算 RAGAS 四项指标，回填 records 的 scores 字段。
+                runs: int = 1) -> None:
+    """对一批 API 答案计算 RAGAS 四项指标（可多轮取均值），回填 records 的 scores 字段。
 
-    判官降方差（方案 A）：
-    - 同一批样本重复评估 repeats 次（默认 3），逐题逐指标取有效分数均值——
-      判官虽已设 temperature=0（_init_evaluators），仍存在采样非确定性，
-      gpt-4o-mini 对相同输入可能给出不同判定，多次取均值压低该噪声；
-    - 调用方式与 run_ragas._run_metrics 一致（raise_exceptions=False，NaN 转 None）。
-
-    分指标 response 口径（方案 D 修复）：
-    - faithfulness / context_precision / context_recall：response 优先用完整
-      陈述句 answer_statement、回落 final_answer（短答案拆不出陈述句会让
-      判官返回 NaN，保持既有口径不变）；
-    - answer_relevancy：response 改用完整 answer——answer_statement 是压缩后
-      的短陈述句，常丢失关键数字（如"扣非净利润增长更快。"不含 43.37%），
-      会系统性拉低 relevancy；完整答案与问题的语义对齐更准确。
-
+    调用方式与 run_ragas._run_metrics 一致（raise_exceptions=False，NaN 转 None）；
     retrieved_contexts 使用预取的同源检索结果，reference 使用黄金答案。
+
+    response 口径统一：优先用完整陈述句 answer_statement（短答案拆不出 claim
+    会被判官记 NaN），回落 final_answer。所有四项指标共用同一 response，
+    不再按指标拆分——拆分口径曾导致 answer_relevancy 从 ~0.75 暴跌至 ~0.43
+    （完整 answer 过长时 RAGAS 生成候选问题语义发散，嵌入相似度失真）。
+
+    runs > 1 时同一批样本重复评估 runs 轮，逐题逐指标取非 null 值的均值：
+    gpt-4o-mini 判官在 temperature=0 下仍存在批次级随机性（10 题样本中，
+    输入完全相同的 context_precision 单题翻转 0.867 -> 0.500 即为该噪声）。
     """
     from ragas import evaluate
     from ragas.dataset_schema import SingleTurnSample, EvaluationDataset
     from ragas.metrics import faithfulness, answer_relevancy, context_precision, context_recall
 
-    # ---- 1) 构造两套口径的评估样本（同一有效集合，仅 response 字段不同） ----
-    samples_stmt: list = []   # 口径1：response = 陈述句优先（faithfulness 等）
-    samples_full: list = []   # 口径2：response = 完整答案（answer_relevancy）
+    # 构建样本：所有指标共用同一 response（answer_statement 优先，回落 final_answer）
+    samples: list = []
     valid_idx: list[int] = []
     for i, rec in enumerate(records):
-        answer = (rec.get("answer") or "").strip()
-        statement = (rec.get("answer_statement") or "").strip()
+        # RAGAS response 口径：优先用完整陈述句（answer_statement），
+        # 回落 final_answer；短答案（人名/数字）拆不出陈述句会让判官返回 NaN
+        answer = (rec.get("answer_statement") or "").strip() or (rec.get("answer") or "").strip()
         contexts = contexts_map.get(rec.get("id")) or []
-        if not (answer or statement) or not contexts:
+        if not answer or not contexts:
             continue  # 无答案或无上下文无法参与指标计算
-        # 两套口径共用的样本字段（user_input/上下文/黄金答案完全一致）
-        common = dict(
+        samples.append(SingleTurnSample(
             user_input=rec.get("question", ""),
+            response=answer,
             retrieved_contexts=[str(c) for c in contexts if c],
             reference=str(rec.get("ground_truth", "") or ""),
-        )
-        # 口径1：陈述句优先、回落完整答案；口径2：完整答案优先、回落陈述句
-        samples_stmt.append(SingleTurnSample(response=statement or answer, **common))
-        samples_full.append(SingleTurnSample(response=answer or statement, **common))
+        ))
         valid_idx.append(i)
     print(f"[benchmark] RAGAS 评估：{len(valid_idx)}/{len(records)} 条有效样本参与计算"
-          f"（每指标重复 {repeats} 次取均值）")
+          f"（每指标 {runs} 轮取均值）")
     if not valid_idx:
         return
 
-    # ---- 2) 重复评估：逐题逐指标收集所有重复中的有效分数 ----
-    # collected[样本偏移][指标名] = 该指标多次重复的分数列表（NaN/失败不计入）
-    collected: list[dict] = [dict() for _ in valid_idx]
-    metrics_stmt = [faithfulness, context_precision, context_recall]
-    for rep in range(1, repeats + 1):
-        print(f"[benchmark] RAGAS 第 {rep}/{repeats} 轮评估 ...")
-        # 两套口径各跑一次 evaluate：faithfulness 系指标 + relevancy 独立口径
-        for samples, metrics in ((samples_stmt, metrics_stmt),
-                                 (samples_full, [answer_relevancy])):
-            result = evaluate(
-                dataset=EvaluationDataset(samples=samples),
-                metrics=metrics,
-                llm=llm,
-                embeddings=embeddings,
-                show_progress=False,
-                raise_exceptions=False,
-            )
-            df = result.to_pandas()
-            for offset, rec_idx in enumerate(valid_idx):
-                row = df.iloc[offset]
-                for metric in [m.name for m in metrics]:
-                    val = row.get(metric)
-                    try:
-                        val = float(val)
-                        if val != val:  # NaN 判定
-                            val = None
-                    except (TypeError, ValueError):
-                        val = None
-                    if val is not None:
-                        collected[offset].setdefault(metric, []).append(val)
+    all_metrics = [faithfulness, answer_relevancy, context_precision, context_recall]
+    # 逐轮评估并按（题目记录下标, 指标）收集各轮分值，最后取均值
+    collected: dict[int, dict[str, list[float]]] = {
+        i: {m: [] for m in METRIC_NAMES} for i in valid_idx
+    }
 
-    # ---- 3) 逐题逐指标取均值回填（所有重复均 NaN/失败则记 None） ----
-    for offset, rec_idx in enumerate(valid_idx):
+    def _run_once() -> None:
+        """单轮评估：解析逐题分值，非 NaN 的追加进 collected。"""
+        result = evaluate(
+            dataset=EvaluationDataset(samples=samples),
+            metrics=all_metrics,
+            llm=llm,
+            embeddings=embeddings,
+            show_progress=False,
+            raise_exceptions=False,
+        )
+        df = result.to_pandas()
+        for offset, rec_idx in enumerate(valid_idx):
+            row = df.iloc[offset]
+            for metric in all_metrics:
+                val = row.get(metric.name)
+                try:
+                    val = float(val)
+                    if val != val:  # NaN 判定
+                        val = None
+                except (TypeError, ValueError):
+                    val = None
+                if val is not None:
+                    collected[rec_idx][metric.name].append(val)
+
+    for run_no in range(1, runs + 1):
+        if runs > 1:
+            print(f"[benchmark] RAGAS 第 {run_no}/{runs} 轮...")
+        _run_once()
+
+    # 逐题逐指标取多轮均值（全部轮次均为 null 则记 None）
+    for rec_idx in valid_idx:
         scores: dict = {}
-        for metric in METRIC_NAMES:
-            vals = collected[offset].get(metric) or []
-            scores[metric] = round(statistics.mean(vals), 6) if vals else None
+        for m in METRIC_NAMES:
+            vals = collected[rec_idx][m]
+            scores[m] = round(statistics.mean(vals), 4) if vals else None
         records[rec_idx]["scores"] = scores
 
 
@@ -494,22 +490,6 @@ _EFFICIENCY_KEYS = [
 ]
 
 
-def _correct_refusal_ids(records: list[dict]) -> set:
-    """提取该批记录中"正确拒答"（答案拒答且黄金答案也拒答）的题目 id 集合。
-
-    答案（陈述句或 final_answer 任一）含拒答模式即视为拒答；
-    正确拒答的元陈述（"未披露X"）无法从上下文逐句印证，RAGAS 打分是噪声。
-    """
-    ids: set = set()
-    for r in records:
-        if r.get("error"):
-            continue  # 请求失败的记录不参与拒答分类
-        ans_text = (r.get("answer_statement") or "") + (r.get("answer") or "")
-        if _is_refusal(ans_text) and _is_refusal(r.get("ground_truth") or ""):
-            ids.add(r.get("id"))
-    return ids
-
-
 def _aggregate_pass(mode_name: str, records: list[dict]) -> dict:
     """汇总单模式的指标：RAGAS 四项质量均值 + token/时延效率均值。
 
@@ -525,13 +505,16 @@ def _aggregate_pass(mode_name: str, records: list[dict]) -> dict:
     agg["有效题数"] = len(ok)
     agg["失败题数"] = len(records) - len(ok)
 
-    # 拒答分类：正确拒答复用 _correct_refusal_ids；错误拒答 = 答案拒答但黄金答案有数据
-    correct_refusal_ids: set = _correct_refusal_ids(records)
-    wrong_refusal = sum(
-        1 for r in ok
-        if _is_refusal((r.get("answer_statement") or "") + (r.get("answer") or ""))
-        and r.get("id") not in correct_refusal_ids
-    )
+    # 拒答分类：答案（陈述句或 final_answer 任一）含拒答模式即视为拒答
+    correct_refusal_ids: set = set()
+    wrong_refusal = 0
+    for r in ok:
+        ans_text = (r.get("answer_statement") or "") + (r.get("answer") or "")
+        if _is_refusal(ans_text):
+            if _is_refusal(r.get("ground_truth") or ""):
+                correct_refusal_ids.add(r.get("id"))
+            else:
+                wrong_refusal += 1
     agg["正确拒答数"] = len(correct_refusal_ids)
     agg["错误拒答数"] = wrong_refusal
 
@@ -561,15 +544,47 @@ def _aggregate_pass(mode_name: str, records: list[dict]) -> dict:
     return agg
 
 
-def _build_comparison(base: dict, opt: dict) -> dict:
-    """双模式对比：质量差值（优化后-优化前）与效率变化率。"""
+def _build_comparison(base: dict, opt: dict,
+                      base_records: list[dict], opt_records: list[dict]) -> dict:
+    """双模式对比：质量差值（优化后-优化前）与效率变化率。
+
+    质量差值附逐题配对统计（降方差方案 A）：按题 id 对齐两臂记录，剔除任一臂的
+    正确拒答题（与均值口径一致），对两臂均有非 null 分值的题计算配对差值
+    （optimized - baseline）的均值与 95% 置信区间（t 分布，配对数 >= 2 才计算）；
+    置信区间不含 0 视为统计显著。均值口径的 diff 保留原样（不变）。
+    """
     comp: dict = {"质量指标（diff=优化后-优化前，正值更优）": {}}
+    # 配对准备：按题 id 对齐两臂记录，剔除正确拒答题（两臂取并集）
+    base_by_id = {r.get("id"): r for r in base_records}
+    opt_by_id = {r.get("id"): r for r in opt_records}
+    excluded = set(base.get("正确拒答题id") or []) | set(opt.get("正确拒答题id") or [])
+    paired_ids = [qid for qid in base_by_id
+                  if qid in opt_by_id and qid not in excluded]
     for m in METRIC_NAMES:
         b, o = base.get(m), opt.get(m)
-        comp["质量指标（diff=优化后-优化前，正值更优）"][m] = {
+        entry = {
             "baseline": b, "optimized": o,
             "diff": round(o - b, 4) if (b is not None and o is not None) else None,
         }
+        # 逐题配对差值：两臂该指标均为非 null 才纳入
+        diffs = [
+            opt_by_id[qid]["scores"][m] - base_by_id[qid]["scores"][m]
+            for qid in paired_ids
+            if (base_by_id[qid].get("scores") and opt_by_id[qid].get("scores")
+                and base_by_id[qid]["scores"].get(m) is not None
+                and opt_by_id[qid]["scores"].get(m) is not None)
+        ]
+        if len(diffs) >= 2:
+            mean_d = statistics.mean(diffs)
+            se = statistics.stdev(diffs) / (len(diffs) ** 0.5)
+            # t 分布 97.5% 分位数（双侧 95% CI，自由度 n-1）
+            t_crit = float(_scipy_stats.t.ppf(0.975, len(diffs) - 1))
+            ci_low, ci_high = mean_d - t_crit * se, mean_d + t_crit * se
+            entry["配对数"] = len(diffs)
+            entry["配对差值均值"] = round(mean_d, 4)
+            entry["差值95%CI"] = [round(ci_low, 4), round(ci_high, 4)]
+            entry["统计显著(CI不含0)"] = bool(ci_low * ci_high > 0)
+        comp["质量指标（diff=优化后-优化前，正值更优）"][m] = entry
     eff: dict = {}
     for _, label in _EFFICIENCY_KEYS:
         b, o = base.get(label), opt.get(label)
@@ -580,58 +595,75 @@ def _build_comparison(base: dict, opt: dict) -> dict:
     return comp
 
 
-def _build_paired_comparison(base_records: list[dict], opt_records: list[dict]) -> dict:
-    """逐题配对差值统计（optimized - baseline）与 95% 置信区间（方案 A）。
-
-    汇总均值的差值易受单题翻转扰动（10 题样本下单题即可扰动均值）；
-    逐题配对消除题目间难度差异后，配对差值的置信区间才是"压缩是否
-    真实影响质量"的判据：CI 含 0 表示两臂差异在 95% 水平上不显著，
-    观测到的差值无法与判官噪声区分。
-
-    口径说明：
-    - 剔除任一臂为"正确拒答"的题（拒答元陈述打分是噪声），与 RAGAS
-      均值聚合口径一致；
-    - 任一臂判官 NaN 的题不参与该指标的配对；
-    - 置信区间用正态近似（均值 ± 1.96 * 标准误），配对题数 >= 30 时
-      与 t 分布临界值（t29 约 2.045）差异可忽略。
-    """
-    # baseline 臂按 id 建索引，供 optimized 臂逐题配对
-    base_by_id = {r.get("id"): r for r in base_records}
-    # 两臂正确拒答 id 并集：任一臂正确拒答即从配对中剔除
-    excluded = _correct_refusal_ids(base_records) | _correct_refusal_ids(opt_records)
-    stats: dict = {}
-    for m in METRIC_NAMES:
-        diffs: list[float] = []
-        for r in opt_records:
-            b = base_by_id.get(r.get("id"))
-            if b is None or r.get("id") in excluded:
-                continue  # 无法配对 / 正确拒答剔除
-            sb = (b.get("scores") or {}).get(m)
-            so = (r.get("scores") or {}).get(m)
-            if sb is None or so is None:
-                continue  # 任一臂判官 NaN 的题不参与该指标配对
-            diffs.append(so - sb)
-        # 配对数不足 2 时无法估计标准差，只报配对数
-        if len(diffs) >= 2:
-            mean = statistics.mean(diffs)
-            se = statistics.stdev(diffs) / (len(diffs) ** 0.5)
-            stats[m] = {
-                "配对题数": len(diffs),
-                "均值": round(mean, 4),
-                "CI95下限": round(mean - 1.96 * se, 4),
-                "CI95上限": round(mean + 1.96 * se, 4),
-                "上升题数": sum(1 for d in diffs if d > 0),
-                "下降题数": sum(1 for d in diffs if d < 0),
-                "持平题数": sum(1 for d in diffs if d == 0),
-            }
-        else:
-            stats[m] = {"配对题数": len(diffs)}
-    return stats
-
-
 def _fmt(v) -> str:
     """报告表格数值格式化：None 显示 N/A。"""
     return "N/A" if v is None else str(v)
+
+
+def _detect_anomalies(base_records: list[dict], opt_records: list[dict]) -> list[dict]:
+    """扫描双臂逐题记录，检测低分与异常退化题目，供后续逐题分析。
+
+    检测规则：
+    1. faithfulness 为 0 分（任一臂）：短答案 claim 不可验证 / 误拒答 / 判官噪声
+    2. 某指标 optimized 比 baseline 下降 > 0.1：L1 压缩可能丢失关键信息
+    3. answer_relevancy < 0.3：response 过短导致 RAGAS 候选问题语义发散
+    4. context_recall < 0.5：检索未覆盖黄金答案所需信息
+    5. 误拒答：answer 含拒答语义但 ground_truth 有实际数据（检索失败）
+    每条异常包含：题号、异常类型、双臂分数、双臂答案摘要、黄金答案摘要、诊断分类。
+    """
+    base_by_id = {r.get("id"): r for r in base_records}
+    opt_by_id = {r.get("id"): r for r in opt_records}
+    anomalies: list[dict] = []
+    _REFUSAL_WORDS = ("未披露", "未提供", "未包含", "未提及", "无法确定", "无法比较")
+
+    for qid in sorted(base_by_id):
+        b = base_by_id[qid]
+        o = opt_by_id.get(qid, {})
+        bs = b.get("scores") or {}
+        os_ = o.get("scores") or {}
+        tags: list[str] = []
+
+        # 1) faithfulness 零分检测
+        bf, of = bs.get("faithfulness"), os_.get("faithfulness")
+        if bf == 0.0 or of == 0.0:
+            tags.append("faithfulness零分")
+
+        # 2) 指标退化检测（optimized - baseline < -0.1）
+        for m in METRIC_NAMES:
+            bv, ov = bs.get(m), os_.get(m)
+            if bv is not None and ov is not None and ov - bv < -0.1:
+                tags.append(f"{m}退化{round(ov - bv, 4)}")
+
+        # 3) 低 answer_relevancy
+        if (bs.get("answer_relevancy") or 0) < 0.3 or (os_.get("answer_relevancy") or 0) < 0.3:
+            tags.append("低relevancy")
+
+        # 4) 低 context_recall
+        if (bs.get("context_recall") or 1) < 0.5 or (os_.get("context_recall") or 1) < 0.5:
+            tags.append("低recall")
+
+        # 5) 误拒答检测：answer 含拒答语义但 GT 有实际数据
+        b_ans = (b.get("answer") or "")[:60]
+        gt = (b.get("ground_truth") or "")[:60]
+        b_refusal = any(w in b_ans for w in _REFUSAL_WORDS)
+        gt_has_data = not any(w in gt for w in _REFUSAL_WORDS) and len(gt) > 10
+        if b_refusal and gt_has_data:
+            tags.append("误拒答(检索失败)")
+
+        if not tags:
+            continue  # 无异常的题跳过
+
+        anomalies.append({
+            "id": qid,
+            "question": b.get("question", "")[:80],
+            "异常类型": tags,
+            "baseline_scores": bs,
+            "optimized_scores": os_,
+            "baseline_answer": (b.get("answer") or "")[:100],
+            "optimized_answer": (o.get("answer") or "")[:100],
+            "ground_truth": gt,
+        })
+    return anomalies
 
 
 def _write_reports(report: dict) -> None:
@@ -645,16 +677,17 @@ def _write_reports(report: dict) -> None:
     lines = [
         "# 自动化评测报告（Benchmark：优化前 vs 优化后）",
         "",
-        f"- 生成时间：{meta['生成时间']} | 模式：{meta['模式']} | 题数：{meta['题数']} | 服务端口：{meta['端口']}",
+        f"- 生成时间：{meta['生成时间']} | 模式：{meta['模式']} | 题数：{meta['题数']}"
+        f" | 服务端口：{meta['端口']} | RAGAS轮数：{meta.get('ragas_runs', 1)}",
         "- 答案来源：本地 /chat 接口（stream=false，每题独立会话）；"
         "上下文：同源检索预取；RAGAS 判官：gpt-4o-mini（AGICTO，temperature=0）",
         "- 优化定义：baseline = L1/L2 上下文压缩关闭；optimized = L1/L2 开启"
         "（双服务实例 KB_ 环境变量固定开关，逐题交错执行消除时段差异）",
-        f"- RAGAS response 口径：faithfulness/context_* 优先使用完整陈述句"
-        f" answer_statement（回落 final_answer）；answer_relevancy 使用完整"
-        f" answer（短陈述句缺关键数字会系统性拉低 relevancy）；"
-        f"每指标重复评估 {meta.get('RAGAS重复次数', 1)} 次取均值；"
-        "正确拒答（答案与黄金答案均拒答）不计入 RAGAS 均值，单独统计",
+        "- RAGAS response 口径（统一）：优先使用完整陈述句 answer_statement（短答案拆不出"
+        "陈述句会被判官记 null，null 不计入均值并单独报告有效/null 题数）；answer_relevancy"
+        " 也用 answer_statement（曾试过用完整 answer 导致 relevancy 从 ~0.75 暴跌至 ~0.43，"
+        "已回退）；正确拒答（答案与黄金答案均拒答）不计入 RAGAS 均值，单独统计；"
+        "每指标多轮评估取逐题均值，对比表附配对差值 95% 置信区间（t 分布）",
         "",
     ]
     for arm, title in (("baseline", "优化前（baseline，L1/L2 关闭）"),
@@ -687,13 +720,18 @@ def _write_reports(report: dict) -> None:
         lines += [
             "## 优化前后对比",
             "",
-            "### 质量指标（RAGAS，越高越好）",
+            "### 质量指标（RAGAS，越高越好；diff = optimized - baseline）",
             "",
-            "| 指标 | 优化前 | 优化后 | 差值 |",
-            "|---|---|---|---|",
+            "| 指标 | 优化前 | 优化后 | 差值 | 配对差值均值 | 差值95%CI | CI不含0(显著) |",
+            "|---|---|---|---|---|---|---|",
         ]
         for m, d in comp["质量指标（diff=优化后-优化前，正值更优）"].items():
-            lines.append(f"| {m} | {_fmt(d['baseline'])} | {_fmt(d['optimized'])} | {_fmt(d['diff'])} |")
+            ci = d.get("差值95%CI")
+            ci_txt = f"[{ci[0]}, {ci[1]}]" if ci else "N/A"
+            lines.append(
+                f"| {m} | {_fmt(d['baseline'])} | {_fmt(d['optimized'])} | {_fmt(d['diff'])} "
+                f"| {_fmt(d.get('配对差值均值'))} | {ci_txt} | {_fmt(d.get('统计显著(CI不含0)'))} |"
+            )
         lines += [
             "",
             "### 效率指标（变化率为正 = 优化后更省/更快）",
@@ -707,30 +745,25 @@ def _write_reports(report: dict) -> None:
             )
         lines.append("")
 
-    # 配对差值统计表（方案 A）：逐题配对 + 95% 置信区间，判据是 CI 是否含 0
-    if "paired_stats" in report:
-        ps = report["paired_stats"]
-        lines += [
-            "### 配对差值统计（optimized - baseline，逐题配对）",
-            "",
-            "| 指标 | 配对题数 | 均值 | 95% CI | 上升 | 下降 | 持平 |",
-            "|---|---|---|---|---|---|---|",
-        ]
-        for m, d in ps.items():
-            if d.get("配对题数", 0) >= 2:
-                ci = f"[{d['CI95下限']}, {d['CI95上限']}]"
-                lines.append(
-                    f"| {m} | {d['配对题数']} | {d['均值']} | {ci} | "
-                    f"{d['上升题数']} | {d['下降题数']} | {d['持平题数']} |"
-                )
-            else:
-                lines.append(f"| {m} | {d.get('配对题数', 0)} | N/A | N/A | N/A | N/A | N/A |")
+    # 异常数据明细（低分题、指标退化题、误拒答题，供逐题分析）
+    anomalies = report.get("anomalies") or []
+    if anomalies:
         lines += [
             "",
-            "注：CI 含 0 表示两臂差异在 95% 水平上不显著（观测差值无法与判官噪声"
-            "区分）；配对剔除任一臂正确拒答的题，与 RAGAS 均值口径一致。",
+            "## 异常数据明细（低分 / 退化 / 误拒答，供逐题分析）",
+            "",
+            f"共 {len(anomalies)} 条异常记录：",
             "",
         ]
+        for a in anomalies:
+            lines.append(f"### id={a['id']}：{a['question']}")
+            lines.append(f"- 异常类型：{', '.join(a['异常类型'])}")
+            lines.append(f"- baseline 分数：{a['baseline_scores']}")
+            lines.append(f"- optimized 分数：{a['optimized_scores']}")
+            lines.append(f"- baseline 答案：{a['baseline_answer']}")
+            lines.append(f"- optimized 答案：{a['optimized_answer']}")
+            lines.append(f"- 黄金答案：{a['ground_truth']}")
+            lines.append("")
 
     with open(REPORT_MD, "w", encoding="utf-8") as f:
         f.write("\n".join(lines))
@@ -760,9 +793,16 @@ def main() -> None:
     parser.add_argument("--limit", type=int, default=30,
                         help="采样题数上限，0=全量，默认 30（10 题样本下单题翻转即可扰动均值，"
                              "扩到 30 题降低 RAGAS 判官随机性与离群时延的干扰）")
-    parser.add_argument("--ragas-repeats", type=int, default=3,
-                        help="RAGAS 每指标重复评估次数（多次取均值压低判官采样噪声），默认 3")
     parser.add_argument("--seed", type=int, default=42, help="随机采样种子，默认 42")
+    parser.add_argument(
+        "--ragas-runs", type=int, default=3,
+        help="RAGAS 每指标重复评估轮数（逐题取均值降判官随机摆动），默认 3",
+    )
+    parser.add_argument(
+        "--from-report", type=str, default="",
+        help="从已有报告复用答案（跳过耗时的 /chat 阶段），指定报告路径；"
+             "仅重跑 RAGAS 评估，适合答案已生成但 RAGAS 失败/超时的场景",
+    )
     args = parser.parse_args()
     if args.baseline:
         args.mode = "baseline"  # --baseline 快捷方式：仅跑优化前
@@ -770,9 +810,36 @@ def main() -> None:
     # 1) 加载 .env（in-process 检索与 RAGAS 判官均依赖其中的 AGICTO_API_KEY）
     load_dotenv()
 
-    # 2) 加载评测问题与公司名（用于补双引号）
-    questions = _load_questions(args.limit, args.seed)
-    company_names = _load_company_names()
+    # --from-report 模式：从已有报告复用答案，跳过 /chat 阶段，仅重跑 RAGAS
+    if args.from_report:
+        print(f"[benchmark] 从已有报告复用答案：{args.from_report}")
+        with open(args.from_report, "r", encoding="utf-8") as f:
+            old_report = json.load(f)
+        passes = {}
+        for name, data in old_report.get("passes", {}).items():
+            records = data.get("records", [])
+            # 清除旧 scores，RAGAS 会重新填充
+            for rec in records:
+                rec.pop("scores", None)
+            passes[name] = records
+            print(f"[benchmark] 复用 {name} 模式 {len(records)} 条答案")
+        # 从复用记录中提取问题列表（用于预取上下文）
+        questions = []
+        for rec in passes.get("baseline") or passes.get("optimized") or []:
+            questions.append({
+                "id": rec.get("id"),
+                "question": rec.get("question", ""),
+                "question_sent": rec.get("question_sent", rec.get("question", "")),
+                "ground_truth": rec.get("ground_truth", ""),
+            })
+        company_names = _load_company_names()
+        if not questions:
+            print("[benchmark] 报告中未找到有效记录，退出")
+            return
+    else:
+        # 2) 加载评测问题与公司名（用于补双引号）
+        questions = _load_questions(args.limit, args.seed)
+        company_names = _load_company_names()
 
     # 3) 预取各题检索上下文（与 /chat 同源检索；L1/L2 不改变检索结果，两模式共用）
     print("[benchmark] 预取检索上下文（in-process，与 /chat 同一检索子系统）...")
@@ -787,50 +854,51 @@ def main() -> None:
             contexts_map[q["id"]] = []
     print(f"[benchmark] 上下文预取完成：{sum(1 for v in contexts_map.values() if v)}/{len(questions)} 题有上下文")
 
-    # 4) 启动服务并执行评测：mode=both 起双服务（env 固定开关）逐题交错执行；
-    #    单模式起单服务整 pass 执行。config.json 全程不被修改（无需备份恢复）。
-    passes: dict[str, list[dict]] = {}
-    if args.mode == "both":
-        proc_base, log_base = _start_server(args.port, SERVER_LOG_BASE, _ENV_L1L2_OFF)
-        try:
-            proc_opt, log_opt = _start_server(args.port + 1, SERVER_LOG_OPT, _ENV_L1L2_ON)
-        except Exception:
-            # optimized 服务启动失败：先清理已就绪的 baseline 服务再抛出
-            _stop_server(proc_base)
-            log_base.close()
-            raise
-        try:
-            print(f"[benchmark] 双服务就绪：baseline（L1/L2 关）端口 {args.port} / "
-                  f"optimized（L1/L2 开）端口 {args.port + 1}")
-            base_records, opt_records = _run_interleaved(
-                questions, company_names, args.port, args.port + 1)
-            passes["baseline"] = base_records
-            passes["optimized"] = opt_records
-        finally:
-            # 无论成败：停止两服务
-            _stop_server(proc_opt)
-            log_opt.close()
-            _stop_server(proc_base)
-            log_base.close()
-    else:
-        # 单模式：env 固定对应开关，单服务整 pass 执行
-        env_extra = _ENV_L1L2_OFF if args.mode == "baseline" else _ENV_L1L2_ON
-        log_path = SERVER_LOG_BASE if args.mode == "baseline" else SERVER_LOG_OPT
-        proc, log_f = _start_server(args.port, log_path, env_extra)
-        try:
-            passes[args.mode] = _run_pass(args.mode, questions, company_names,
-                                           args.port, log_path)
-        finally:
-            # 无论成败：停止服务
-            _stop_server(proc)
-            log_f.close()
+    if not args.from_report:
+        # 4) 启动服务并执行评测：mode=both 起双服务（env 固定开关）逐题交错执行；
+        #    单模式起单服务整 pass 执行。config.json 全程不被修改（无需备份恢复）。
+        passes: dict[str, list[dict]] = {}
+        if args.mode == "both":
+            proc_base, log_base = _start_server(args.port, SERVER_LOG_BASE, _ENV_L1L2_OFF)
+            try:
+                proc_opt, log_opt = _start_server(args.port + 1, SERVER_LOG_OPT, _ENV_L1L2_ON)
+            except Exception:
+                # optimized 服务启动失败：先清理已就绪的 baseline 服务再抛出
+                _stop_server(proc_base)
+                log_base.close()
+                raise
+            try:
+                print(f"[benchmark] 双服务就绪：baseline（L1/L2 关）端口 {args.port} / "
+                      f"optimized（L1/L2 开）端口 {args.port + 1}")
+                base_records, opt_records = _run_interleaved(
+                    questions, company_names, args.port, args.port + 1)
+                passes["baseline"] = base_records
+                passes["optimized"] = opt_records
+            finally:
+                # 无论成败：停止两服务
+                _stop_server(proc_opt)
+                log_opt.close()
+                _stop_server(proc_base)
+                log_base.close()
+        else:
+            # 单模式：env 固定对应开关，单服务整 pass 执行
+            env_extra = _ENV_L1L2_OFF if args.mode == "baseline" else _ENV_L1L2_ON
+            log_path = SERVER_LOG_BASE if args.mode == "baseline" else SERVER_LOG_OPT
+            proc, log_f = _start_server(args.port, log_path, env_extra)
+            try:
+                passes[args.mode] = _run_pass(args.mode, questions, company_names,
+                                               args.port, log_path)
+            finally:
+                # 无论成败：停止服务
+                _stop_server(proc)
+                log_f.close()
 
-    # 7) RAGAS 质量评估（服务已停止，判官独立调用 AGICTO）
+    # 7) RAGAS 质量评估（服务已停止，判官独立调用 AGICTO；多轮取均值降判官方差）
     llm, embeddings = _init_evaluators()
     for name, records in passes.items():
         print(f"\n[benchmark] 对 {name} 模式的 {len(records)} 条答案计算 RAGAS 指标...")
         try:
-            _eval_ragas(records, contexts_map, llm, embeddings, repeats=args.ragas_repeats)
+            _eval_ragas(records, contexts_map, llm, embeddings, runs=args.ragas_runs)
         except Exception as err:
             print(f"[benchmark] {name} 模式 RAGAS 评估失败: {err}")
 
@@ -841,10 +909,8 @@ def main() -> None:
             "模式": args.mode,
             "题数": len(questions),
             "端口": args.port,
-            "RAGAS重复次数": args.ragas_repeats,
-            "答案来源": "本地 /chat 接口（stream=false）",
+            "答案来源": "复用已有报告（--from-report）" if args.from_report else "本地 /chat 接口（stream=false）",
             "优化定义": "baseline=L1/L2关闭，optimized=L1/L2开启（双服务 KB_ 环境变量固定开关，逐题交错执行）",
-            "RAGAS口径": "faithfulness/context_* 用 answer_statement 优先；answer_relevancy 用完整 answer；每指标重复评估取均值",
         },
         "passes": {
             name: {"summary": _aggregate_pass(name, records), "records": records}
@@ -855,16 +921,17 @@ def main() -> None:
         report["comparison"] = _build_comparison(
             report["passes"]["baseline"]["summary"],
             report["passes"]["optimized"]["summary"],
+            passes["baseline"],
+            passes["optimized"],
         )
-        # 配对差值统计（方案 A）：逐题配对 + 95% CI，补充汇总均值对比的显著性判据
-        report["paired_stats"] = _build_paired_comparison(
-            report["passes"]["baseline"]["records"],
-            report["passes"]["optimized"]["records"],
-        )
+        # 异常数据检测：低分题、指标退化题、误拒答题（供后续逐题分析）
+        report["anomalies"] = _detect_anomalies(passes["baseline"], passes["optimized"])
     _write_reports(report)
 
     # 9) 控制台摘要
     print("\n===== Benchmark 摘要 =====")
+    if report.get("anomalies"):
+        print(f"异常数据：{len(report['anomalies'])} 条（低分/退化/误拒答，详见报告）")
     for name, data in report["passes"].items():
         s = data["summary"]
         print(f"\n[{name}] 有效题数 {s['有效题数']}/{s['总题数']}"
@@ -874,18 +941,17 @@ def main() -> None:
         for _, label in _EFFICIENCY_KEYS:
             print(f"  {label}: {s.get(label)}")
     if "comparison" in report:
+        comp_q = report["comparison"]["质量指标（diff=优化后-优化前，正值更优）"]
+        print("\n===== 质量对比（diff=optimized-baseline，附配对差值95%CI）=====")
+        for m, d in comp_q.items():
+            ci = d.get("差值95%CI")
+            extra = (f" | 配对均值={d.get('配对差值均值')} CI={ci} 显著={d.get('统计显著(CI不含0)')}"
+                     if ci else "")
+            print(f"{m}: baseline={d['baseline']} optimized={d['optimized']} diff={d['diff']}{extra}")
         comp = report["comparison"]["效率指标"]
         print("\n===== 效率对比（变化率为正 = 优化后更省/更快）=====")
         for label, d in comp.items():
             print(f"{label}: baseline={d['baseline']} optimized={d['optimized']} 变化率={d['变化率_正值更省']}")
-    if "paired_stats" in report:
-        print("\n===== 配对差值统计（optimized - baseline，CI 含 0 = 差异不显著）=====")
-        for m, d in report["paired_stats"].items():
-            if d.get("配对题数", 0) >= 2:
-                print(f"{m}: 均值={d['均值']} 95%CI=[{d['CI95下限']}, {d['CI95上限']}] "
-                      f"上升={d['上升题数']} 下降={d['下降题数']} 持平={d['持平题数']} (n={d['配对题数']})")
-            else:
-                print(f"{m}: 配对数不足（n={d.get('配对题数', 0)}）")
 
 
 if __name__ == "__main__":

@@ -66,7 +66,10 @@ class BM25Retriever:
                 if parent_page["page"] not in seen_pages:
                     seen_pages.add(parent_page["page"])
                     result = {
+                        # distance 保留原始 BM25 分数（历史字段名）；
+                        # similarity 为统一语义字段：越大越相关（BM25 分数即相关性分数）
                         "distance": score,
+                        "similarity": score,
                         "page": parent_page["page"],
                         "text": parent_page["text"],
                         "file_name": source_file_name
@@ -74,7 +77,10 @@ class BM25Retriever:
                     retrieval_results.append(result)
             else:
                 result = {
+                    # distance 保留原始 BM25 分数（历史字段名）；
+                    # similarity 为统一语义字段：越大越相关（BM25 分数即相关性分数）
                     "distance": score,
+                    "similarity": score,
                     "page": chunk["page"],
                     "text": chunk["text"],
                     "file_name": source_file_name
@@ -230,6 +236,8 @@ class VectorRetriever:
         # 获取 query 的 embedding，支持 openai/dashscope
         embedding = self._get_embedding(query)
         embedding_array = np.array(embedding, dtype=np.float32).reshape(1, -1)
+        # 索引为 IndexFlatIP（内积），search 返回的"distances"实为内积相似度：越大越相关
+        # （embedding 向量近似单位向量，内积即余弦相似度），与 BM25 分数方向一致
         distances, indices = vector_db.search(x=embedding_array, k=actual_top_n)
         retrieval_results = []
         seen_pages = set()
@@ -243,7 +251,10 @@ class VectorRetriever:
                 if parent_page["page"] not in seen_pages:
                     seen_pages.add(parent_page["page"])
                     result = {
+                        # distance 保留原始内积相似度（历史字段名，易误导为 L2 距离）；
+                        # similarity 为统一语义字段：越大越相关（此处即 IndexFlatIP 内积相似度）
                         "distance": distance,
+                        "similarity": distance,
                         "page": parent_page["page"],
                         "text": parent_page["text"],
                         "file_name": source_file_name
@@ -251,7 +262,10 @@ class VectorRetriever:
                     retrieval_results.append(result)
             else:
                 result = {
+                    # distance 保留原始内积相似度（历史字段名，易误导为 L2 距离）；
+                    # similarity 为统一语义字段：越大越相关（此处即 IndexFlatIP 内积相似度）
                     "distance": distance,
+                    "similarity": distance,
                     "page": chunk.get("page", 0),
                     "text": chunk["text"],
                     "file_name": source_file_name
@@ -284,6 +298,8 @@ class VectorRetriever:
         for page in sorted(pages, key=lambda p: p["page"]):
             result = {
                 "distance": 0.5,
+                # retrieve_all 返回全部页面，无相关性排序概念，占位 0.5 保持中性
+                "similarity": 0.5,
                 "page": page["page"],
                 "text": page["text"],
                 "file_name": source_file_name

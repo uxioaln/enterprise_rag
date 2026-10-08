@@ -117,12 +117,15 @@ class L1ToolResultCompressor:
         parts = re.split(r"(?<=[。！？；\n])", content)
         return [p.strip() for p in parts if p and p.strip()]
 
-    def _extract_keywords(self, question: str) -> tuple[list[str], list[str]]:
-        """从问题中提取（关键词列表, 年份列表）。
+    def _extract_keywords(self, question: str) -> tuple[list[str], list[str], list[str]]:
+        """从问题中提取（关键词列表, 年份列表, 实体名列表）。
 
         年份为 4 位数字，作为强信号（命中句子每年 +2 分）；关键词为滤除
         实体后缀/疑问指令词/单字虚词后、长度>=2 的连续中英文数字片段
         （纯数字片段不作为关键词，交由年份逻辑处理）。
+        实体名为问题中的公司/机构名（含"公司""股份""时代""银行"等后缀
+        的连续中文片段），用于强制保留含实体名的句子——L1 压缩曾因丢弃
+        含公司名的标题句导致 LLM 误判"公司名不在上下文中"（id=14 案例）。
         """
         # 1) 年份直接用正则提取（去重保序）
         years = list(dict.fromkeys(re.findall(r"\d{4}", question)))
@@ -136,7 +139,22 @@ class L1ToolResultCompressor:
         for chunk in re.findall(r"[\u4e00-\u9fa5A-Za-z0-9]+", normalized):
             if len(chunk) >= 2 and not chunk.isdigit() and chunk not in keywords:
                 keywords.append(chunk)
-        return keywords, years
+        # 4) 实体名提取：从原始问题中匹配含公司后缀的连续中文片段
+        # 用于强制保留含实体名的句子（即使该句关键词得分不高）
+        entity_patterns = [
+            r"[\u4e00-\u9fa5]{2,}(?:股份有限公司|股份有限公司|集团|时代|银行|国际|汽车|能源|茅台)",
+            r"[\u4e00-\u9fa5]{2,}(?:公司|股份)",
+        ]
+        entities: list[str] = []
+        for pat in entity_patterns:
+            for m in re.findall(pat, question):
+                if m not in entities:
+                    entities.append(m)
+        # 去重：实体名如果与关键词重复则从关键词中移除（避免双重计分）
+        for ent in entities:
+            if ent in keywords:
+                keywords.remove(ent)
+        return keywords, years, entities
 
     def _keyword_hit(self, keyword: str, sentence: str) -> bool:
         """判断关键词是否命中句子。
@@ -154,18 +172,37 @@ class L1ToolResultCompressor:
         return False
 
     def _select_relevant(self, content: str, question: str) -> str:
-        """问题感知截断：选取命中问题关键词的句子及上下文窗口拼接为摘要。"""
-        # 1) 切句并提取问题关键词与年份
+        """问题感知截断：选取命中问题关键词的句子及上下文窗口拼接为摘要。
+
+        评分规则（在原有关键词+年份基础上增加两条）：
+        - 命中关键词每词 +1 分（原有）
+        - 命中年份每年 +2 分（原有）
+        - 含实体名（公司名）的句子强制入选（新增：防止 L1 丢弃公司名
+          标题句导致 LLM 误判"公司名不在上下文中"，id=14 案例）
+        - 含 4 位以上数字或金融单位（亿元/万元/%/元）的句子 +1 分（新增：
+          金融答案依赖精确数字，数字句丢失会导致 LLM 从参数知识补数字
+          产生幻觉，id=9 案例）
+        """
+        # 1) 切句并提取问题关键词、年份与实体名
         sentences = self._split_sentences(content)
-        keywords, years = self._extract_keywords(question)
-        # 2) 关键词与年份均为空（问题全是虚词）时，退化为前 N 字（原有逻辑）
-        if (not keywords and not years) or not sentences:
+        keywords, years, entities = self._extract_keywords(question)
+        # 2) 关键词、年份与实体名均为空（问题全是虚词）时，退化为前 N 字
+        if (not keywords and not years and not entities) or not sentences:
             return content[: self.summary_chars]
-        # 3) 逐句打分：每个命中关键词 +1 分，每个命中年份 +2 分
+        # 3) 逐句打分：关键词 +1、年份 +2、数字句 +1
         scored: list[tuple[int, int]] = []
+        # 实体名命中的句子索引集合（强制入选，不受 top_k 限制）
+        entity_hit_idx: set[int] = set()
         for idx, sentence in enumerate(sentences):
             score = sum(1 for k in keywords if self._keyword_hit(k, sentence))
             score += 2 * sum(1 for y in years if y in sentence)
+            # 数字句加分：含 4 位以上数字或金融单位词的句子 +1
+            if re.search(r"\d{4,}|\d+[,.]?\d*%|\d+[亿万亿]元?", sentence):
+                score += 1
+            # 实体名命中：强制标记入选
+            if any(ent in sentence for ent in entities):
+                entity_hit_idx.add(idx)
+                score = max(score, 1)  # 确保至少 1 分以进入 scored 列表
             if score > 0:
                 scored.append((idx, score))
         # 4) 无任何命中：同样退化为前 N 字
@@ -178,7 +215,13 @@ class L1ToolResultCompressor:
             lo = max(0, idx - self.context_window)
             hi = min(len(sentences), idx + self.context_window + 1)
             selected.update(range(lo, hi))
-        # 6) 按原文顺序拼接，超过 summary_chars 时硬截断兜底
+        # 6) 实体名命中句强制入选（即使不在 top_k 中也纳入）
+        selected.update(entity_hit_idx)
+        for idx in entity_hit_idx:
+            lo = max(0, idx - self.context_window)
+            hi = min(len(sentences), idx + self.context_window + 1)
+            selected.update(range(lo, hi))
+        # 7) 按原文顺序拼接，超过 summary_chars 时硬截断兜底
         summary = "".join(sentences[i] for i in sorted(selected))
         return summary[: self.summary_chars]
 

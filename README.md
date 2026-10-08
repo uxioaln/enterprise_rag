@@ -145,25 +145,25 @@ curl -X POST "http://localhost:8000/chat?stream=false" \
 | Top-5 召回率 | 待补充 | 86.7% | — |
 | 幻觉率 | 18% | 7% | -11 pp |
 
-**RAGAS 回归（最新一轮实测，产物见 [data/eval/benchmark_report.json](data/eval/benchmark_report.json)）**：L1/L2 压缩关闭（baseline）vs 开启（optimized），10 题、每题独立会话、双臂逐题交错执行、判官 gpt-4o-mini：
+**RAGAS 回归（最新一轮实测，产物见 [data/eval/benchmark_report.json](data/eval/benchmark_report.json)）**：L1/L2 压缩关闭（baseline）vs 开启（optimized），30 题、每题独立会话、双臂逐题交错执行、判官 gpt-4o-mini（temperature=0，每指标 3 轮取均值）：
 
-| 指标 | baseline（L1/L2 关） | optimized（L1/L2 开） | 变化（optimized - baseline） |
-|---|---|---|---|
-| faithfulness | 0.6333 | 0.5167 | -0.1166 |
-| answer_relevancy | 0.7786 | 0.751 | -0.0276 |
-| context_precision | 0.7211 | 0.6609 | -0.0602 |
-| context_recall | 0.75 | 0.7333 | -0.0167 |
-| 平均每题 input_tokens（服务端） | 3747.9 | 3373.3 | -10.0% |
-| 平均每题 final_prompt_tokens（本地估算） | 2795.1 | 2448.1 | -12.4% |
+| 指标 | baseline（L1/L2 关） | optimized（L1/L2 开） | 变化（optimized - baseline） | 配对差值95%CI | 统计显著 |
+|---|---|---|---|---|---|
+| faithfulness | 0.6331 | 0.6663 | +0.0332 | [-0.061, +0.123] | 否 |
+| answer_relevancy | 0.7448 | 0.7463 | +0.0015 | [-0.034, +0.039] | 否 |
+| context_precision | 0.8355 | 0.8214 | -0.0141 | [-0.031, +0.025] | 否 |
+| context_recall | 0.78 | 0.8194 | +0.0394 | [-0.009, +0.046] | 否 |
+| 平均每题 input_tokens（服务端） | 4914.6 | 4400.5 | -10.5% | — | — |
+| 平均每题 final_prompt_tokens（本地估算） | 3613.4 | 3288.0 | -9.0% | — | — |
 
-注意：单轮、10 题场景下压缩仅省约 10% token，且四项 RAGAS 指标均有下降；主表 -50% 的 Token 收益来自 30+ 轮长程对话场景，两者口径不同，不可直接比较。
+注意：30 题、3 轮均值场景下 L1/L2 压缩的四项 RAGAS 指标变化均不显著（95% CI 含 0），faithfulness 与 context_recall 反而小幅上升；主表 -50% 的 Token 收益来自 30+ 轮长程对话场景，两者口径不同，不可直接比较。异常数据（低分题、指标退化题、误拒答题）明细见报告的"异常数据明细"章节，供逐题分析用。
 
 **口径说明**：
 
-- **Token**：基线为不做任何压缩的朴素 RAG，场景为 30+ 轮长程对话。待补充：Token 统计方式（服务端 `prompt_tokens` 还是本地估算）与样本数。
+- **Token**：基线为不做任何压缩的朴素 RAG，场景为 30+ 轮长程对话。服务端 `prompt_tokens` 口径，30 题均值。
 - **召回率**：混合检索（FAISS + BM25）+ LLM 重排后的 Top-5 召回率，对比对象为单路向量检索。待补充：单路向量检索基线的召回率数值、评测集构成与规模。
 - **幻觉率**：开启置信度评估 + 自动重试前后的对比。待补充：幻觉判定方法（人工标注还是 RAGAS faithfulness 阈值反推）与样本数。
-- **回归评测**：自建金融查询评测集 30 条；上表 RAGAS 回归最新一轮跑 10 题，覆盖比亚迪 / 贵州茅台 / 宁德时代 / 中芯国际年报（含 ground_truth），指标为 faithfulness / answer_relevancy / context_precision / context_recall。
+- **回归评测**：自建金融查询评测集 30 条；覆盖比亚迪 / 贵州茅台 / 宁德时代 / 中芯国际年报（含 ground_truth），指标为 faithfulness / answer_relevancy / context_precision / context_recall；判官 gpt-4o-mini（temperature=0，每指标 3 轮取均值），response 口径统一用 answer_statement。
 
 ## 目录结构
 
@@ -196,11 +196,14 @@ enterprise_rag/
 
 ## 局限与 TODO
 
-1. **评测集规模小**：自建评测集 30 条，统计意义有限，未覆盖全部金融文档类型与问法分布。
-2. **未做线上流量验证**：全部指标来自离线评测，真实并发下的表现（吞吐、延迟分布）未测量。
-3. **仅支持 PDF 输入**：Word / HTML / 扫描件等其他格式未适配。
-4. **单一模型供应商**：embedding / LLM / 重排均依赖 AGICTO 平台，未做多 provider 故障切换。
-5. **图状态不持久化**：LangGraph 图未接 checkpointer，长程任务的断点续跑尚不支持。
+1. **评测集规模小**：自建评测集 30 条，统计意义有限（配对差值 95% CI 较宽），未覆盖全部金融文档类型与问法分布。
+2. **短答案 faithfulness 偏低**：纯数字/人名类短答案（如"王传福""21.6%"）在 RAGAS faithfulness 中被判 0 分（claim 无法从上下文逐字验证），属评测口径限制而非真实幻觉；待通过 prompt 层引导 LLM 输出引用型陈述句改善。
+3. **检索误拒答**：部分题（如茅台国内外营收分项）的答案在年报中存在但未被检索命中，导致系统误判"未披露"；待通过表格感知分块与检索 top-K 自适应改善。
+4. **L2 压缩未在评测中触发**：RAGAS 回归每题独立会话（1 轮），L2 历史压缩（max_rounds=5）从不激活；评测仅覆盖 L1 工具结果裁剪的效果。
+5. **未做线上流量验证**：全部指标来自离线评测，真实并发下的表现（吞吐、延迟分布）未测量。
+6. **仅支持 PDF 输入**：Word / HTML / 扫描件等其他格式未适配。
+7. **单一模型供应商**：embedding / LLM / 重排均依赖 AGICTO 平台，未做多 provider 故障切换。
+8. **图状态不持久化**：LangGraph 图未接 checkpointer，长程任务的断点续跑尚不支持。
 
 ## 许可与引用
 

@@ -563,6 +563,8 @@ class RerankingPrompt:
    0.9 = 高度相关
    1 = 完全匹配
 3. 只基于内容客观评价，不做假设。
+4. 输出格式：必须为合法 JSON，不要包含 markdown 代码块标记或额外说明文字，字段如下：
+   {"relevance_score": 0.0到1.0之间的浮点数, "reasoning": "简要理由"}
 """
 
     system_prompt_rerank_multiple_blocks = """
@@ -584,6 +586,9 @@ class RerankingPrompt:
    0.9 = 高度相关
    1 = 完全匹配
 3. 只基于内容客观评价，不做假设。
+4. 输出格式：必须为合法 JSON，不要包含 markdown 代码块标记或额外说明文字，结构如下：
+   {"block_rankings": [{"relevance_score": 0.0到1.0之间的浮点数, "reasoning": "简要理由"}, ...]}
+   block_rankings 数组长度必须与输入文本块数量一致，顺序与输入一致。
 """
 
 class RetrievalRankingSingleBlock(BaseModel):
